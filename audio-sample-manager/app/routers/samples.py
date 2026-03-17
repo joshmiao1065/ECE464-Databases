@@ -5,7 +5,7 @@ from typing import List
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -135,25 +135,54 @@ async def _run_mir_pipeline(sample_id: uuid.UUID) -> None:
             features = await loop.run_in_executor(
                 None, extract_features, audio_bytes
             )
+            # Upsert: delete any previously-written rows on retry so INSERT succeeds.
+            existing_meta = await db.execute(
+                select(AudioMetadata).where(AudioMetadata.sample_id == sample_id)
+            )
+            if existing_meta.scalar_one_or_none():
+                await db.execute(
+                    delete(AudioMetadata).where(AudioMetadata.sample_id == sample_id)
+                )
             db.add(AudioMetadata(sample_id=sample_id, is_processed=True, **features))
 
             # ── 2. CLAP — 512-dim embedding (CPU/GPU-bound, run in thread) ────
             embedding_vec = await loop.run_in_executor(
                 None, registry.clap().encode_audio, audio_bytes
             )
+            existing_emb = await db.execute(
+                select(AudioEmbedding).where(AudioEmbedding.sample_id == sample_id)
+            )
+            if existing_emb.scalar_one_or_none():
+                await db.execute(
+                    delete(AudioEmbedding).where(AudioEmbedding.sample_id == sample_id)
+                )
             db.add(AudioEmbedding(sample_id=sample_id, embedding=embedding_vec))
 
             # ── 3 & 4. YAMNet + MusiCNN — run concurrently in thread pool ─────
-            yamnet_tags, musicnn_tags = await asyncio.gather(
-                loop.run_in_executor(None, registry.yamnet().predict, audio_bytes),
-                loop.run_in_executor(None, registry.musicnn().predict, audio_bytes),
-            )
+            # Workers may return None if TF/MusiCNN is unavailable; skip gracefully.
+            yamnet_worker = registry.yamnet()
+            musicnn_worker = registry.musicnn()
+
+            tag_futures = {}
+            if yamnet_worker:
+                tag_futures["yamnet"] = loop.run_in_executor(
+                    None, yamnet_worker.predict, audio_bytes
+                )
+            if musicnn_worker:
+                tag_futures["musicnn"] = loop.run_in_executor(
+                    None, musicnn_worker.predict, audio_bytes
+                )
+
+            tag_results = {}
+            if tag_futures:
+                results = await asyncio.gather(*tag_futures.values())
+                tag_results = dict(zip(tag_futures.keys(), results))
 
             # Merge results; skip duplicate (sample_id, tag_id) pairs
             seen_tag_ids: set = set()
-            for tag_name in yamnet_tags:
+            for tag_name in tag_results.get("yamnet", []):
                 await _upsert_tag(db, sample_id, tag_name, "yamnet", seen_tag_ids)
-            for tag_name in musicnn_tags:
+            for tag_name in tag_results.get("musicnn", []):
                 await _upsert_tag(db, sample_id, tag_name, "musicnn", seen_tag_ids)
 
             if queue_entry:

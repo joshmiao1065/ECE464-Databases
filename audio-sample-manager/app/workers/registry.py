@@ -8,11 +8,17 @@ many routers or background tasks use them.
 Usage:
     from app.workers import registry
     embedding = registry.clap().encode_audio(audio_bytes)
-    tags      = registry.yamnet().predict(audio_bytes)
-    tags      = registry.musicnn().predict(audio_bytes)
+    tags      = registry.yamnet().predict(audio_bytes)   # may return None if TF unavailable
+    tags      = registry.musicnn().predict(audio_bytes)  # may return None if MusiCNN unavailable
 """
 
 import functools
+import logging
+
+log = logging.getLogger(__name__)
+
+_YAMNET_UNAVAILABLE = False
+_MUSICNN_UNAVAILABLE = False
 
 
 @functools.lru_cache(maxsize=None)
@@ -24,13 +30,39 @@ def clap():
 
 @functools.lru_cache(maxsize=None)
 def yamnet():
-    """Return the shared YAMNetWorker instance (TF Hub model loads on first call)."""
-    from app.workers.yamnet_worker import YAMNetWorker
-    return YAMNetWorker()
+    """
+    Return the shared YAMNetWorker instance, or None if TensorFlow is unavailable.
+    The pipeline skips YAMNet tagging gracefully when None is returned.
+    """
+    global _YAMNET_UNAVAILABLE
+    if _YAMNET_UNAVAILABLE:
+        return None
+    try:
+        from app.workers.yamnet_worker import YAMNetWorker
+        return YAMNetWorker()
+    except Exception as exc:
+        log.warning("YAMNet unavailable (%s: %s) — skipping in pipeline", type(exc).__name__, exc)
+        _YAMNET_UNAVAILABLE = True
+        return None
 
 
 @functools.lru_cache(maxsize=None)
 def musicnn():
-    """Return the shared MusiCNNWorker instance (MTT model loads on first call)."""
-    from app.workers.musicnn_worker import MusiCNNWorker
-    return MusiCNNWorker()
+    """
+    Return the shared MusiCNNWorker instance, or None if MusiCNN is unavailable.
+    The pipeline skips MusiCNN tagging gracefully when None is returned.
+    """
+    global _MUSICNN_UNAVAILABLE
+    if _MUSICNN_UNAVAILABLE:
+        return None
+    try:
+        # Pre-test the import that predict() will need. MusiCNNWorker.__init__ is a
+        # no-op so the registry would otherwise create the worker successfully even
+        # when musicnn's TF dependency is broken, causing predict() to fail later.
+        from musicnn.tagger import top_tags  # noqa: F401
+        from app.workers.musicnn_worker import MusiCNNWorker
+        return MusiCNNWorker()
+    except Exception as exc:
+        log.warning("MusiCNN unavailable (%s: %s) — skipping in pipeline", type(exc).__name__, exc)
+        _MUSICNN_UNAVAILABLE = True
+        return None

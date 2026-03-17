@@ -30,12 +30,16 @@ numpy==1.23.5
 
 # ML models
 torch==2.3.0
+torchvision==0.18.0
 transformers==4.41.2
 laion-clap==1.1.4
 
 # YAMNet (via TensorFlow Hub)
+# Note: TF 2.16 + protobuf 4.x conflicts with TF 2.20 (pulled by tf-keras).
+# YAMNet and MusiCNN are skipped gracefully if TF is unavailable.
 tensorflow-cpu==2.16.1
 tensorflow-hub==0.16.0
+tf-keras==2.16.0
 
 # MusiCNN — MTG music tagger (genre, mood, instrumentation)
 # installed separately with --no-deps due to stale numpy<1.17 constraint

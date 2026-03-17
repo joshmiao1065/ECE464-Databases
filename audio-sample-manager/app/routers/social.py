@@ -82,7 +82,7 @@ async def post_comment(
     comment = Comment(user_id=current_user.id, sample_id=sample_id, text=payload.text)
     db.add(comment)
     await db.commit()
-    # CommentOut is built manually (includes username), so no db.refresh needed
+    await db.refresh(comment)  # populate server-generated id and created_at
     return CommentOut(
         id=comment.id,
         user_id=comment.user_id,
