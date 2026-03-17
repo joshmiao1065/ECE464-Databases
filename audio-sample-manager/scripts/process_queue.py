@@ -142,7 +142,11 @@ async def run_worker(poll_interval: int, max_retries: int, stale_minutes: int, o
 
         log.info("[job] Processing sample %s (retry=%d) …", sample_id, retry)
         try:
-            await _run_mir_pipeline(sample_id)
+            # claimed=True: this worker already set status='processing' via
+            # SELECT FOR UPDATE SKIP LOCKED above, so the pipeline must not
+            # attempt a second atomic claim (it would find status != 'pending'
+            # and bail out prematurely).
+            await _run_mir_pipeline(sample_id, claimed=True)
             processed += 1
             log.info("[job] Done — sample %s. Total processed: %d.", sample_id, processed)
         except Exception:
