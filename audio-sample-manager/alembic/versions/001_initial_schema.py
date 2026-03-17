@@ -6,6 +6,7 @@ Create Date: 2026-03-12
 """
 from alembic import op
 import sqlalchemy as sa
+from sqlalchemy.dialects.postgresql import ENUM as PgEnum
 from pgvector.sqlalchemy import Vector
 
 revision = "001"
@@ -25,10 +26,16 @@ def upgrade() -> None:
     # Enums
     # -------------------------------------------------------------------------
     op.execute("""
-        CREATE TYPE processing_status AS ENUM ('pending', 'processing', 'done', 'failed')
+        DO $$ BEGIN
+            CREATE TYPE processing_status AS ENUM ('pending', 'processing', 'done', 'failed');
+        EXCEPTION WHEN duplicate_object THEN NULL;
+        END $$
     """)
     op.execute("""
-        CREATE TYPE query_type AS ENUM ('text', 'audio')
+        DO $$ BEGIN
+            CREATE TYPE query_type AS ENUM ('text', 'audio');
+        EXCEPTION WHEN duplicate_object THEN NULL;
+        END $$
     """)
 
     # -------------------------------------------------------------------------
@@ -265,8 +272,8 @@ def upgrade() -> None:
         sa.Column("user_id", sa.UUID(as_uuid=True),
                   sa.ForeignKey("users.id", ondelete="SET NULL"), nullable=True),
         sa.Column("query_text", sa.Text, nullable=True),
-        sa.Column("query_type", sa.Enum("text", "audio", name="query_type"), nullable=False,
-                  server_default="'text'"),
+        sa.Column("query_type", PgEnum("text", "audio", name="query_type", create_type=False), nullable=False,
+                  server_default=sa.text("'text'")),
         sa.Column("result_count", sa.Integer, nullable=True),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False,
                   server_default=sa.text("NOW()")),
@@ -282,8 +289,8 @@ def upgrade() -> None:
         sa.Column("sample_id", sa.UUID(as_uuid=True),
                   sa.ForeignKey("samples.id", ondelete="CASCADE"), nullable=False),
         sa.Column("status",
-                  sa.Enum("pending", "processing", "done", "failed", name="processing_status"),
-                  nullable=False, server_default="'pending'"),
+                  PgEnum("pending", "processing", "done", "failed", name="processing_status", create_type=False),
+                  nullable=False, server_default=sa.text("'pending'")),
         sa.Column("retry_count", sa.SmallInteger, nullable=False, server_default="0"),
         sa.Column("worker_id", sa.String(100), nullable=True),  # detect stalled jobs
         sa.Column("error_log", sa.Text, nullable=True),

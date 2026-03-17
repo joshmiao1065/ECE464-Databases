@@ -21,11 +21,12 @@ httpx==0.27.0
 # Auth
 python-jose[cryptography]==3.3.0
 passlib[bcrypt]==1.7.4
+bcrypt==4.0.1
 
 # Audio processing
 librosa==0.10.2
 soundfile==0.12.1
-numpy==1.26.4
+numpy==1.23.5
 
 # ML models
 torch==2.3.0
@@ -37,4 +38,5 @@ tensorflow-cpu==2.16.1
 tensorflow-hub==0.16.0
 
 # MusiCNN — MTG music tagger (genre, mood, instrumentation)
-musicnn==0.1.6
+# installed separately with --no-deps due to stale numpy<1.17 constraint
+# musicnn==0.1.0
