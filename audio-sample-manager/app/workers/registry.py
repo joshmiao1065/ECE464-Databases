@@ -14,6 +14,12 @@ Usage:
 
 import functools
 import logging
+import os
+
+# MusiCNN uses tf.compat.v1.layers (Keras 2 API). TF 2.16+ defaults to Keras 3,
+# which removed these legacy layers. Setting this env var before TF is first
+# imported forces TF to use tf-keras (Keras 2) instead.
+os.environ.setdefault("TF_USE_LEGACY_KERAS", "1")
 
 log = logging.getLogger(__name__)
 

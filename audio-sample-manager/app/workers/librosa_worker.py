@@ -16,7 +16,7 @@ def extract_features(audio_bytes: bytes) -> dict:
 
     # BPM
     tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
-    bpm = float(tempo)
+    bpm = float(np.atleast_1d(tempo)[0])
 
     # Key — dominant chroma bin (root note only; mode detection is a future enhancement)
     chroma = librosa.feature.chroma_cqt(y=y, sr=sr)

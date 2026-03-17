@@ -26,21 +26,26 @@ bcrypt==4.0.1
 # Audio processing
 librosa==0.10.2
 soundfile==0.12.1
-numpy==1.23.5
+numpy>=1.26.0  # TF 2.20 requires >=1.26; _utils module added in 1.25 (was missing in 1.23)
 
-# ML models
+# ML models (CLAP)
 torch==2.3.0
 torchvision==0.18.0
 transformers==4.41.2
 laion-clap==1.1.4
 
-# YAMNet (via TensorFlow Hub)
-# Note: TF 2.16 + protobuf 4.x conflicts with TF 2.20 (pulled by tf-keras).
-# YAMNet and MusiCNN are skipped gracefully if TF is unavailable.
-tensorflow-cpu==2.16.1
+# YAMNet + MusiCNN (TensorFlow ecosystem)
+# TF 2.20 ships with Keras 3 which removed tf.compat.v1.layers.
+# tf-keras restores the Keras 2 / legacy-layer support required by musicnn.
+# Set TF_USE_LEGACY_KERAS=1 before importing TF (done in app/workers/registry.py).
+tensorflow==2.20.0
 tensorflow-hub==0.16.0
-tf-keras==2.16.0
+tf-keras==2.20.1
+
+# setuptools<71 required: tensorflow-hub 0.16 uses `from pkg_resources import parse_version`
+# which was removed in setuptools 71+. Pin to <=70 to keep pkg_resources importable.
+setuptools<71
 
 # MusiCNN — MTG music tagger (genre, mood, instrumentation)
-# installed separately with --no-deps due to stale numpy<1.17 constraint
-# musicnn==0.1.0
+# Install with --no-deps: musicnn pins numpy<1.17 which conflicts with TF 2.20.
+# musicnn==0.1.0   →  pip install --no-deps musicnn==0.1.0
