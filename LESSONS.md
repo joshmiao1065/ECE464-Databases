@@ -1,8 +1,30 @@
 # Debugging Lessons — Audio Sample Manager
 
 Accumulated debugging knowledge for agents and developers working on this codebase.
-Read this file at the start of every new conversation (it is listed in CLAUDE.md).
-Update it immediately whenever a new bug is root-caused or a new pattern is discovered.
+
+## Agent Protocol — Read and Write Rules
+
+**Read:** Load this file at the start of every conversation, before writing any code.
+
+**Write:** Update this file autonomously — no need to be asked. Add a new numbered
+lesson any time you:
+- Root-cause a bug (even one you introduced and fixed yourself)
+- Discover a non-obvious behaviour in any library or service used here
+- Make an architectural decision that future agents should not re-litigate
+- Find a faster or safer way to do something that currently has a worse pattern
+
+**Format:** Add new lessons at the bottom with the next sequential number. Never
+renumber existing lessons — CLAUDE.md references them by number. Keep each lesson
+self-contained: symptom, root cause, fix, and enough context to apply it without
+reading surrounding code.
+
+**Commit:** After any edit, run:
+```bash
+cd "/mnt/c/Users/joshu/OneDrive/Cooper Union/Databases"
+git add LESSONS.md audio-sample-manager/CLAUDE.md
+git commit -m "Update LESSONS.md: <brief description of new lesson>"
+git push origin main
+```
 
 ---
 
@@ -696,3 +718,54 @@ the most redundant). See lesson 18 for the deletion pattern. Key steps:
 4. `DELETE FROM samples WHERE <condition>` — cascades handle everything
 5. `DELETE FROM tags WHERE id NOT IN (SELECT DISTINCT tag_id FROM sample_tags)`
 6. Restart the worker in a user-owned terminal
+
+
+---
+
+## 22. Deployment Architecture: ML Models vs. Cloud RAM Limits
+
+### The Problem
+CLAP (~900 MB weights), YAMNet, and MusiCNN together require ~3 GB RAM at runtime.
+Railway free tier provides 512 MB. You cannot load all three ML models on Railway's
+free tier — the process will OOM-kill before serving any requests.
+
+### Recommended Architecture (hybrid cloud/local)
+- **Railway** — hosts FastAPI (`uvicorn app.main:app`). Loads CLAP only (needed for
+  search text/audio encoding). Does NOT run `process_queue`.
+- **Vercel** — hosts the React/Vite frontend as a static build.
+- **Supabase** — Postgres DB + Storage (already cloud, no change).
+- **Local machine** — runs `process_queue` worker. Has direct access to Supabase DB
+  and Storage over the internet. This is a legitimate hybrid architecture.
+
+This is acceptable because the worker is a background batch job, not a user-facing
+service. Producers get search results from Railway; samples get processed from the
+local machine. Both read/write the same Supabase DB.
+
+### If Railway free tier OOMs on CLAP
+Options in order of preference:
+1. Upgrade to Railway Starter ($5/mo, 8 GB RAM) — CLAP loads fine.
+2. Lazy-load CLAP (only on first search request) — may still OOM depending on
+   baseline memory usage from FastAPI + asyncpg + other imports.
+3. Disable the search endpoint on Railway and document it as a known limitation.
+   Search still works when running locally.
+
+### Required changes before deploying
+1. **CORS** — add the Vercel production URL to `allow_origins` in `app/main.py`.
+   Currently only `http://localhost:5173` is allowed.
+2. **Frontend API URL** — set `VITE_API_URL` in Vercel env to the Railway backend
+   URL. The Vite dev proxy (`localhost:8000`) only works locally.
+3. **Railway env vars** — set all vars from `.env` in Railway's dashboard:
+   `DATABASE_URL`, `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_KEY`,
+   `SUPABASE_STORAGE_BUCKET`, `SECRET_KEY`, `ACCESS_TOKEN_EXPIRE_MINUTES`.
+   Never commit `.env` to git.
+4. **`--workers 1`** on Railway — ML worker singletons are not safe across forked
+   processes. Use a single uvicorn worker.
+
+### Demo social data (seed before presentation)
+Comments, ratings, and collections all have 0 rows. Before the demo:
+- Create a second user account via `POST /api/auth/register`
+- Rate several samples via `POST /api/samples/{id}/ratings`
+- Leave comments via `POST /api/samples/{id}/comments`
+- Create a collection and add samples via the collections endpoints
+This takes ~10 minutes via Swagger UI (`http://localhost:8000/docs`) but is
+important for showing the social schema is actually being used.

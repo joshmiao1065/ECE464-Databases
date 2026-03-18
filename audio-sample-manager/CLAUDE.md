@@ -1,9 +1,26 @@
-> **Agents:** Also read `../LESSONS.md` (one level up, in the repo root) at the
-> start of every conversation. It contains hard-won debugging patterns for
-> SQLAlchemy async, TF eager execution, MusiCNN subprocess isolation, asyncio
-> event-loop lifetime, and more. Update it immediately whenever a new bug is
-> root-caused. Keeping LESSONS.md current makes every future debugging session
-> shorter.
+> **Agents — mandatory reading and writing protocol:**
+>
+> 1. **Read `../LESSONS.md`** (repo root) at the start of every conversation.
+>    It contains debugging patterns, operational rules, and architecture decisions
+>    accumulated across all development sessions. Do not skip this.
+>
+> 2. **Read this file (`CLAUDE.md`)** fully before writing any code or making
+>    any architectural decisions.
+>
+> 3. **Update both files autonomously** — you do not need to be asked. Any time
+>    you root-cause a bug, discover a non-obvious behaviour, make a significant
+>    architectural decision, or learn something that would save a future agent
+>    time: write it down immediately in the appropriate file and commit.
+>    - New debugging pattern or gotcha → `LESSONS.md`
+>    - Project structure, requirements, deployment, operational facts → `CLAUDE.md`
+>
+> 4. **Commit after every update.** Both files live in the git repo. Run
+>    `git add LESSONS.md audio-sample-manager/CLAUDE.md && git commit -m "..."
+>    && git push origin main` after every substantive edit.
+>
+> 5. **Keep LESSONS.md numbered sequentially.** Add new lessons at the bottom
+>    with the next number. Never renumber existing lessons — other references
+>    in CLAUDE.md point to them by number.
 
 # Audio Sample Manager — Project Context
 
@@ -27,6 +44,103 @@ Always run `git log --oneline -10` for the current state — the table above goe
 MIR-powered audio sample discovery platform built as a Cooper Union Databases final project.
 Producers search a library of audio samples using natural language or by uploading a reference clip.
 The backend automatically classifies every sample with BPM, key, energy, and semantic tags.
+
+---
+
+## Course Requirements & Completion Status
+
+This is a Cooper Union ECE464 Databases final project (40% of final grade).
+Agents should be aware of outstanding requirements when suggesting work.
+
+| Requirement | Status | Notes |
+|---|---|---|
+| Individual effort | ✅ | Solo project |
+| 10–15 tables | ✅ | 16 tables implemented |
+| Authentication | ✅ | JWT, bcrypt, register/login, Bearer tokens, ownership guards |
+| **Cloud deployment** | ❌ **NOT DONE** | Biggest remaining gap — see Deployment section below |
+| Alembic migrations | ✅ | Async runner; no raw SQL fixes |
+| External integration | ✅ | Freesound API, Supabase Storage, CLAP, YAMNet, MusiCNN |
+| Data seed / scraper | ✅ | 4,000 samples from Freesound; overnight batch ingestion |
+| ★ Complexity component | ✅✅✅ | Vector DB + 3 ML models + concurrent background pipeline |
+
+### Deliverables still outstanding
+- **Live public URL** — app must be deployed (Railway + Vercel). See Deployment section.
+- **Formal write-up** — project goals, architecture, 3-bug war room log, retrospective.
+  Bug material is already documented in LESSONS.md §1–3 (PendingRollbackError,
+  TF eager conflict, MusiCNN subprocess isolation).
+- **Final demo** — 10-minute live demo + schema/complexity Q&A on last day of class.
+- **Social data** — comments, ratings, collections all have 0 rows. Seed demo data
+  before the presentation so the social schema looks used.
+
+### ★ Complexity component (very strong — emphasise in write-up and demo)
+Three ML models running in a concurrent background pipeline:
+- LAION-CLAP (512-dim audio/text joint embedding, semantic search)
+- Google YAMNet (521 AudioSet sound-event classes)
+- MTG MusiCNN (MagnaTagATune genre/mood/instrumentation tags)
+Plus: cross-process TF/PyTorch isolation, subprocess pooling, custom retry/recovery,
+pgvector HNSW index, and a three-session DB architecture to survive PgBouncer timeouts.
+
+---
+
+## Deployment (CRITICAL — not yet done)
+
+The app currently runs locally only. It must be live at a public URL for the grade.
+
+### Target architecture
+- **Backend → Railway** (`uvicorn app.main:app`)
+- **Frontend → Vercel** (`npm run build` → static deploy)
+- **Database + Storage → Supabase** (already cloud, no change needed)
+- **MIR worker → local machine** (see below)
+
+### Why the worker stays local
+CLAP (~900 MB), YAMNet, and MusiCNN together require ~3 GB RAM. Railway free tier
+allows 512 MB. The worker (`process_queue`) only needs to reach the Supabase DB and
+Storage, both of which are already public cloud services. Running the worker locally
+while the API is on Railway is a legitimate hybrid architecture.
+
+### The search endpoint needs CLAP on Railway
+`POST /api/search/text` and `POST /api/search/audio` call `registry.clap()` to
+encode the query vector before hitting pgvector. This means CLAP must load on
+Railway at runtime. Options in order of preference:
+1. **Railway Starter ($5/mo, 8 GB RAM)** — load CLAP normally, everything works.
+2. **Lazy loading** — CLAP only loads on first search request; Railway may still OOM
+   on the free tier depending on other memory usage.
+3. **Pre-compute only** — disable search endpoint on Railway, only serve browse/CRUD.
+   Search works locally. Acceptable for demo if noted as a known limitation.
+
+### Environment variables needed on Railway
+All vars from `.env`: `DATABASE_URL`, `SUPABASE_URL`, `SUPABASE_ANON_KEY`,
+`SUPABASE_SERVICE_KEY`, `SUPABASE_STORAGE_BUCKET`, `SECRET_KEY`,
+`ACCESS_TOKEN_EXPIRE_MINUTES`. Do NOT commit `.env` to git.
+
+### CORS update required before deployment
+`app/main.py` currently allows only `http://localhost:5173`. Add the Vercel
+production URL to `allow_origins` before deploying.
+
+### Frontend env var
+Set `VITE_API_URL` in Vercel's environment settings to the Railway backend URL.
+The Vite proxy (localhost:8000) only works in dev; production needs the real URL.
+
+---
+
+## Current Database State (as of 2026-03-18)
+
+```
+samples:          4,000
+audio_embeddings:   491  (processing ongoing — ~3/min)
+audio_metadata:     491
+tags:               123
+sample_tags:      3,020  (~6 auto-tags per processed sample)
+users:              1    (developer only — needs demo data)
+comments:           0    ← needs seeding before demo
+ratings:            0    ← needs seeding before demo
+collections:        0    ← needs seeding before demo
+processing_queue: 4,000  (492 done, 3,508 pending)
+search_queries:    19
+```
+
+Processing at ~3 samples/min with worker running. ~20 hours of worker time to
+drain the full queue. Run `curl http://localhost:8000/api/admin/queue` to check.
 
 ---
 
