@@ -144,23 +144,39 @@ async def _run_mir_pipeline(sample_id: uuid.UUID, claimed: bool = False) -> None
     • Process-level: _pipeline_semaphore(1) serialises concurrent pipeline calls
       within the same process so CLAP/Librosa are never called from multiple
       threads at once.
+
+    Connection lifetime
+    -------------------
+    ML inference (Librosa, CLAP, YAMNet, MusiCNN) can take 60–120 s.
+    Holding an asyncpg connection idle for that long causes the server-side
+    connection to be closed (Supabase PgBouncer reaps idle connections after
+    ~30 s), resulting in ConnectionResetError inside the next DB call.
+
+    To avoid this, the pipeline uses *three separate sessions*:
+      Session A — claim the queue entry + fetch file_url (fast, < 1 s)
+      No session — download audio + run all ML workers (slow, 60–120 s)
+      Session B — write results + update queue status (fast, < 1 s)
+    A separate Session C is opened only if ML raises an exception, to mark
+    the queue entry as failed without relying on the possibly-broken session.
     """
     loop = asyncio.get_running_loop()
-    now = datetime.now(timezone.utc)
+
+    # ── Session A: Claim + fetch file_url ─────────────────────────────────────
+    file_url: str | None = None
+    queue_entry_id: uuid.UUID | None = None
 
     async with AsyncSessionLocal() as db:
-
-        # ── Step 1: Claim the queue entry ──────────────────────────────────────
         if not claimed:
-            # Atomically transition pending → processing.
-            # If 0 rows are updated another worker beat us here — bail out.
             claim = await db.execute(
                 update(ProcessingQueue)
                 .where(
                     ProcessingQueue.sample_id == sample_id,
                     ProcessingQueue.status == ProcessingStatus.pending,
                 )
-                .values(status=ProcessingStatus.processing, updated_at=now)
+                .values(
+                    status=ProcessingStatus.processing,
+                    updated_at=datetime.now(timezone.utc),
+                )
                 .returning(ProcessingQueue.id)
             )
             await db.commit()
@@ -170,84 +186,105 @@ async def _run_mir_pipeline(sample_id: uuid.UUID, claimed: bool = False) -> None
                 )
                 return
 
-        # Load the queue entry (needed for status updates later).
         q_result = await db.execute(
             select(ProcessingQueue).where(ProcessingQueue.sample_id == sample_id)
         )
         queue_entry = q_result.scalar_one_or_none()
+        if queue_entry:
+            queue_entry_id = queue_entry.id
 
-        # ── Step 2: Acquire process-level semaphore ────────────────────────────
-        # Waits if another pipeline is already running in this process.
-        # The event loop remains live during the wait — I/O, HTTP, ingestion
-        # all continue; only the ML section is serialised.
-        async with _pipeline_semaphore:
+        s_result = await db.execute(select(Sample).where(Sample.id == sample_id))
+        sample = s_result.scalar_one_or_none()
+        if not sample:
+            # Mark failed immediately — nothing to process.
+            if queue_entry:
+                queue_entry.status = ProcessingStatus.failed
+                queue_entry.error_log = f"Sample {sample_id} not found in samples table"
+                queue_entry.updated_at = datetime.now(timezone.utc)
+                await db.commit()
+            return
+        file_url = sample.file_url
+    # Session A closed — connection returned to pool before ML starts.
 
-            try:
-                s_result = await db.execute(
-                    select(Sample).where(Sample.id == sample_id)
+    # ── No DB session: download + ML inference ────────────────────────────────
+    async with _pipeline_semaphore:
+        error: Exception | None = None
+        features = embedding_vec = tag_results = None
+
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as http:
+                resp = await http.get(file_url)
+                resp.raise_for_status()
+                audio_bytes = resp.content
+
+            features = await loop.run_in_executor(None, extract_features, audio_bytes)
+
+            embedding_vec = await loop.run_in_executor(
+                None, registry.clap().encode_audio, audio_bytes
+            )
+
+            yamnet_worker = registry.yamnet()
+            musicnn_worker = registry.musicnn()
+            tag_futures = {}
+            if yamnet_worker:
+                tag_futures["yamnet"] = loop.run_in_executor(
+                    None, yamnet_worker.predict, audio_bytes
                 )
-                sample = s_result.scalar_one_or_none()
-                if not sample:
-                    raise ValueError(f"Sample {sample_id} not found in samples table")
-
-                # Download audio bytes from Supabase Storage
-                async with httpx.AsyncClient(timeout=60.0) as http:
-                    resp = await http.get(sample.file_url)
-                    resp.raise_for_status()
-                    audio_bytes = resp.content
-
-                # ── Librosa: audio features ────────────────────────────────────
-                features = await loop.run_in_executor(None, extract_features, audio_bytes)
-
-                # Delete any row from a previous failed attempt before inserting.
-                await db.execute(
-                    delete(AudioMetadata).where(AudioMetadata.sample_id == sample_id)
+            if musicnn_worker:
+                tag_futures["musicnn"] = loop.run_in_executor(
+                    None, musicnn_worker.predict, audio_bytes
                 )
-                db.add(AudioMetadata(sample_id=sample_id, is_processed=True, **features))
-
-                # ── CLAP: 512-dim audio embedding ──────────────────────────────
-                embedding_vec = await loop.run_in_executor(
-                    None, registry.clap().encode_audio, audio_bytes
-                )
-                await db.execute(
-                    delete(AudioEmbedding).where(AudioEmbedding.sample_id == sample_id)
-                )
-                db.add(AudioEmbedding(sample_id=sample_id, embedding=embedding_vec))
-
-                # ── YAMNet + MusiCNN: auto-tags (optional, TF-dependent) ───────
-                yamnet_worker = registry.yamnet()
-                musicnn_worker = registry.musicnn()
-
-                tag_futures = {}
-                if yamnet_worker:
-                    tag_futures["yamnet"] = loop.run_in_executor(
-                        None, yamnet_worker.predict, audio_bytes
-                    )
-                if musicnn_worker:
-                    tag_futures["musicnn"] = loop.run_in_executor(
-                        None, musicnn_worker.predict, audio_bytes
-                    )
-
+            if tag_futures:
+                values = await asyncio.gather(*tag_futures.values())
+                tag_results = dict(zip(tag_futures.keys(), values))
+            else:
                 tag_results = {}
-                if tag_futures:
-                    values = await asyncio.gather(*tag_futures.values())
-                    tag_results = dict(zip(tag_futures.keys(), values))
 
-                seen_tag_ids: set = set()
-                for tag_name in tag_results.get("yamnet", []):
-                    await _upsert_tag(db, sample_id, tag_name, "yamnet", seen_tag_ids)
-                for tag_name in tag_results.get("musicnn", []):
-                    await _upsert_tag(db, sample_id, tag_name, "musicnn", seen_tag_ids)
+        except Exception as exc:
+            log.exception("MIR pipeline failed for sample %s", sample_id)
+            error = exc
 
-                if queue_entry:
-                    queue_entry.status = ProcessingStatus.done
-                    queue_entry.updated_at = datetime.now(timezone.utc)
+        # ── Session B (or C): write results / mark status ──────────────────────
+        async with AsyncSessionLocal() as db:
+            if error is not None:
+                # ML failed — mark queue entry as failed.
+                if queue_entry_id:
+                    await db.execute(
+                        update(ProcessingQueue)
+                        .where(ProcessingQueue.id == queue_entry_id)
+                        .values(
+                            status=ProcessingStatus.failed,
+                            error_log=str(error),
+                            updated_at=datetime.now(timezone.utc),
+                        )
+                    )
                 await db.commit()
+                return
 
-            except Exception as exc:
-                log.exception("MIR pipeline failed for sample %s", sample_id)
-                if queue_entry:
-                    queue_entry.status = ProcessingStatus.failed
-                    queue_entry.error_log = str(exc)
-                    queue_entry.updated_at = datetime.now(timezone.utc)
-                await db.commit()
+            # ML succeeded — write features, embedding, tags, done status.
+            await db.execute(
+                delete(AudioMetadata).where(AudioMetadata.sample_id == sample_id)
+            )
+            db.add(AudioMetadata(sample_id=sample_id, is_processed=True, **features))
+
+            await db.execute(
+                delete(AudioEmbedding).where(AudioEmbedding.sample_id == sample_id)
+            )
+            db.add(AudioEmbedding(sample_id=sample_id, embedding=embedding_vec))
+
+            seen_tag_ids: set = set()
+            for tag_name in (tag_results or {}).get("yamnet", []):
+                await _upsert_tag(db, sample_id, tag_name, "yamnet", seen_tag_ids)
+            for tag_name in (tag_results or {}).get("musicnn", []):
+                await _upsert_tag(db, sample_id, tag_name, "musicnn", seen_tag_ids)
+
+            if queue_entry_id:
+                await db.execute(
+                    update(ProcessingQueue)
+                    .where(ProcessingQueue.id == queue_entry_id)
+                    .values(
+                        status=ProcessingStatus.done,
+                        updated_at=datetime.now(timezone.utc),
+                    )
+                )
+            await db.commit()

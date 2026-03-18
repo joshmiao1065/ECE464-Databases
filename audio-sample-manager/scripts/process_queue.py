@@ -11,6 +11,18 @@ Usage (from repo root):
     python -m scripts.process_queue
     python -m scripts.process_queue --poll-interval 5 --max-retries 2 --stale-minutes 10
     python -m scripts.process_queue --once          # process current backlog then exit
+
+Utility flags (run once, then exit — does not enter the processing loop):
+    python -m scripts.process_queue --reset-failed
+        Reset all 'failed' queue entries back to 'pending' so they are retried.
+
+    python -m scripts.process_queue --requeue-done-missing-tags
+        Find 'done' samples that have no YAMNet or MusiCNN auto-tags and reset
+        them to 'pending' so the full pipeline (including tagging) runs again.
+        Useful when samples were ingested before YAMNet/MusiCNN were working.
+
+    Combine both to prepare and then immediately process:
+        python -m scripts.process_queue --reset-failed --requeue-done-missing-tags --once
 """
 
 import argparse
@@ -31,6 +43,7 @@ from sqlalchemy.orm import selectinload
 
 from app.database import AsyncSessionLocal
 from app.models.system import ProcessingQueue, ProcessingStatus
+from app.models.tag import Tag, SampleTag
 from app.routers.samples import _run_mir_pipeline
 
 logging.basicConfig(
@@ -54,6 +67,64 @@ def _install_signal_handlers() -> None:
 
     signal.signal(signal.SIGTERM, _handle)
     signal.signal(signal.SIGINT, _handle)
+
+
+async def reset_failed(db) -> int:
+    """
+    Reset all 'failed' queue entries back to 'pending' so they can be retried.
+    Returns the number of rows updated.
+    """
+    result = await db.execute(
+        update(ProcessingQueue)
+        .where(ProcessingQueue.status == ProcessingStatus.failed)
+        .values(
+            status=ProcessingStatus.pending,
+            retry_count=0,
+            error_log=None,
+            worker_id=None,
+            updated_at=datetime.now(timezone.utc),
+        )
+    )
+    await db.commit()
+    return result.rowcount
+
+
+async def requeue_done_missing_tags(db) -> int:
+    """
+    Find 'done' samples that have no YAMNet or MusiCNN auto-tags and reset
+    them to 'pending' so the full pipeline re-runs (including tagging).
+
+    This is necessary for samples that were processed before YAMNet/MusiCNN
+    were added to the pipeline — those runs only produced librosa features
+    and CLAP embeddings but no auto-tags.
+
+    Returns the number of queue rows updated.
+    """
+    # Subquery: sample_ids that already have at least one yamnet/musicnn tag.
+    tagged_sample_ids = (
+        select(SampleTag.sample_id)
+        .join(Tag, SampleTag.tag_id == Tag.id)
+        .where(Tag.category.in_(["yamnet", "musicnn"]))
+        .distinct()
+        .scalar_subquery()
+    )
+
+    result = await db.execute(
+        update(ProcessingQueue)
+        .where(
+            ProcessingQueue.status == ProcessingStatus.done,
+            ProcessingQueue.sample_id.not_in(tagged_sample_ids),
+        )
+        .values(
+            status=ProcessingStatus.pending,
+            retry_count=0,
+            error_log=None,
+            worker_id=None,
+            updated_at=datetime.now(timezone.utc),
+        )
+    )
+    await db.commit()
+    return result.rowcount
 
 
 async def _claim_pending(db, stale_cutoff: datetime) -> ProcessingQueue | None:
@@ -171,6 +242,21 @@ async def run_worker(poll_interval: int, max_retries: int, stale_minutes: int, o
     log.info("Shutdown. Processed %d sample(s), skipped %d.", processed, skipped)
 
 
+async def run_utility(args) -> None:
+    """Run utility operations (--reset-failed, --requeue-done-missing-tags) then exit."""
+    if args.reset_failed:
+        async with AsyncSessionLocal() as db:
+            n = await reset_failed(db)
+        log.info("--reset-failed: reset %d failed queue entries to pending.", n)
+
+    if args.requeue_done_missing_tags:
+        async with AsyncSessionLocal() as db:
+            n = await requeue_done_missing_tags(db)
+        log.info(
+            "--requeue-done-missing-tags: reset %d done-but-untagged entries to pending.", n
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Process pending MIR pipeline jobs from processing_queue."
@@ -204,10 +290,35 @@ def main() -> None:
         action="store_true",
         help="Process all current pending jobs then exit instead of polling continuously.",
     )
+    parser.add_argument(
+        "--reset-failed",
+        action="store_true",
+        help=(
+            "Reset all 'failed' queue entries back to 'pending' with retry_count=0 "
+            "so they are re-attempted.  Runs before the processing loop."
+        ),
+    )
+    parser.add_argument(
+        "--requeue-done-missing-tags",
+        action="store_true",
+        help=(
+            "Find 'done' samples that have no YAMNet or MusiCNN auto-tags and reset "
+            "them to 'pending'.  Use this to re-process samples that were ingested "
+            "before YAMNet/MusiCNN were working.  Runs before the processing loop."
+        ),
+    )
     args = parser.parse_args()
 
     _install_signal_handlers()
-    asyncio.run(run_worker(args.poll_interval, args.max_retries, args.stale_minutes, args.once))
+
+    async def _main() -> None:
+        # Run utility operations first (in the same event loop as the worker
+        # so asyncpg's connection pool is not tied to a stale loop).
+        if args.reset_failed or args.requeue_done_missing_tags:
+            await run_utility(args)
+        await run_worker(args.poll_interval, args.max_retries, args.stale_minutes, args.once)
+
+    asyncio.run(_main())
 
 
 if __name__ == "__main__":

@@ -1,3 +1,10 @@
+> **Agents:** Also read `../LESSONS.md` (one level up, in the repo root) at the
+> start of every conversation. It contains hard-won debugging patterns for
+> SQLAlchemy async, TF eager execution, MusiCNN subprocess isolation, asyncio
+> event-loop lifetime, and more. Update it immediately whenever a new bug is
+> root-caused. Keeping LESSONS.md current makes every future debugging session
+> shorter.
+
 # Audio Sample Manager — Project Context
 
 MIR-powered audio sample discovery platform built as a Cooper Union Databases final project.
@@ -221,17 +228,36 @@ When a sample is created via `POST /api/samples/`, a `ProcessingQueue` row is in
 
 ### Pipeline steps (`app/routers/samples.py: _run_mir_pipeline`)
 
+The pipeline is split across **three separate DB sessions** to prevent connection
+timeouts. Supabase PgBouncer recycles idle connections after ~30 s; holding one
+session open across 60–120 s of ML inference caused `ConnectionResetError` followed
+by `PendingRollbackError`. See LESSONS.md §1 for full details.
+
 ```
-1. Mark ProcessingQueue.status = 'processing'
-2. Download audio bytes from sample.file_url (Supabase Storage) via httpx
-3. [thread] Librosa → extract_features(audio_bytes) → INSERT audio_metadata
-4. [thread] CLAP    → encode_audio(audio_bytes)     → INSERT audio_embeddings
-5. [thread] YAMNet  )
-   [thread] MusiCNN ) → asyncio.gather (concurrent) → upsert tags + sample_tags
-6. Mark ProcessingQueue.status = 'done' (or 'failed' + error_log on exception)
+Session A (< 1 s):
+  1. Atomically claim ProcessingQueue entry (UPDATE WHERE status='pending')
+  2. Fetch sample.file_url
+  3. Close session — connection returned to pool.
+
+No session (60–120 s):
+  4. Download audio bytes from Supabase Storage via httpx
+  5. [thread] Librosa  → extract_features(audio_bytes)
+  6. [thread] CLAP     → encode_audio(audio_bytes)
+  7. [thread] YAMNet   )
+     [thread] MusiCNN  ) → asyncio.gather (concurrent)
+
+Session B (< 1 s):
+  8. DELETE + INSERT audio_metadata (Librosa features)
+  9. DELETE + INSERT audio_embeddings (CLAP 512-dim vector)
+ 10. UPSERT tags + sample_tags (YAMNet + MusiCNN labels)
+ 11. Mark ProcessingQueue.status = 'done'
+ 12. Close session.
+
+On exception: Session C (fresh) marks status = 'failed' + writes error_log.
 ```
 
-Steps 3–5 use `loop.run_in_executor(None, ...)` to avoid blocking the async event loop during CPU-bound inference. YAMNet and MusiCNN run concurrently via `asyncio.gather`.
+Steps 5–7 use `loop.run_in_executor(None, ...)` to avoid blocking the async event
+loop. YAMNet and MusiCNN run concurrently via `asyncio.gather`.
 
 ### Worker registry (`app/workers/registry.py`)
 
@@ -247,6 +273,11 @@ registry.musicnn() # → MusiCNNWorker (MTT_musicnn checkpoint)
 
 **Never instantiate workers directly.** Always go through the registry so there is only one copy of the weights in memory.
 
+**Critical — do NOT `import musicnn.tagger` in the main process.** That module calls
+`tf.compat.v1.disable_eager_execution()` at import time, which silently breaks
+YAMNet. The registry's `musicnn()` function is safe because `MusiCNNWorker` only
+imports musicnn inside a subprocess. See LESSONS.md §2 for full details.
+
 ### Worker details
 
 | Worker | Input | Output | Notes |
@@ -255,7 +286,16 @@ registry.musicnn() # → MusiCNNWorker (MTT_musicnn checkpoint)
 | `CLAPWorker.encode_text(str)` | Natural language string | `list[float]` len 512 | Used by search endpoint |
 | `extract_features(bytes)` | Raw audio bytes | `dict` matching `audio_metadata` columns | Returns `bpm, key, energy_level, loudness_lufs, spectral_centroid, zero_crossing_rate, sample_rate` |
 | `YAMNetWorker.predict(bytes, top_k=5)` | Raw audio bytes | `List[str]` | 521 AudioSet classes; resamples to 16 kHz |
-| `MusiCNNWorker.predict(bytes, top_k=5)` | Raw audio bytes | `List[str]` | MagnaTagATune ~50 classes; writes temp MP3 file, encodes, deletes |
+| `MusiCNNWorker.predict(bytes, top_k=5)` | Raw audio bytes | `List[str]` | MagnaTagATune ~50 classes; **runs in subprocess** — see `musicnn_worker.py` |
+
+**MusiCNN subprocess isolation** (`app/workers/musicnn_worker.py`):
+MusiCNNWorker runs musicnn inside a persistent `ProcessPoolExecutor(spawn=1)`.
+This prevents `tf.compat.v1.disable_eager_execution()` from contaminating the
+main process. The subprocess is recreated automatically if it crashes
+(`BrokenProcessPool` handler with single retry). Each call writes a temp MP3,
+submits to the subprocess, and deletes the temp file in a `finally` block.
+Audio shorter than 3 s returns `[]` instead of crashing (musicnn `UnboundLocalError`
+on `batch` variable). See LESSONS.md §2 and §3.
 
 ### Tag deduplication
 
@@ -461,6 +501,15 @@ python -m scripts.process_queue
 
 # Custom poll interval and retry limit
 python -m scripts.process_queue --poll-interval 5 --max-retries 2 --stale-minutes 10
+
+# Reset all 'failed' entries back to 'pending' (retry them)
+python -m scripts.process_queue --reset-failed
+
+# Re-process 'done' samples that have no YAMNet/MusiCNN tags
+python -m scripts.process_queue --requeue-done-missing-tags
+
+# Combine: reset failed + requeue untagged, then process everything
+python -m scripts.process_queue --reset-failed --requeue-done-missing-tags --once
 ```
 
 ### How it works
@@ -470,6 +519,36 @@ python -m scripts.process_queue --poll-interval 5 --max-retries 2 --stale-minute
 - Resets `processing` entries that haven't been updated in `--stale-minutes` back to `pending`
 - Increments `retry_count` on failure; skips samples that reach `--max-retries` (marks as `failed`)
 - Handles `SIGTERM` / `SIGINT` gracefully — finishes the current job then exits
+- All async work runs in a **single `asyncio.run(_main())`** call so asyncpg's
+  connection pool is never bound to a stale event loop (see LESSONS.md §4)
+
+### Monitoring queue progress
+
+```bash
+curl http://localhost:8000/api/admin/queue
+```
+
+Returns JSON:
+```json
+{
+  "counts": {"pending": 1100, "processing": 1, "done": 90, "failed": 2},
+  "total": 1193,
+  "percent_done": 7.5,
+  "recent_failures": [{"sample_id": "...", "retry_count": 1, "error": "..."}]
+}
+```
+
+This endpoint is defined in `app/main.py` as `GET /api/admin/queue`.
+
+---
+
+## API Endpoints (additional)
+
+### Admin / Meta
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| GET | `/health` | — | Returns `{"status": "ok"}` |
+| GET | `/api/admin/queue` | — | Pipeline queue summary: counts per status, percent done, recent failures |
 
 ---
 
@@ -480,3 +559,8 @@ python -m scripts.process_queue --poll-interval 5 --max-retries 2 --stale-minute
 - **MusiCNN `predict` uses the MTT_musicnn model** (MagnaTagATune, ~50 tags). The MSD_musicnn model (Million Song Dataset, more tags) is also available — swap `model="MTT_musicnn"` in `musicnn_worker.py` if you want broader coverage.
 - **No audio upload to storage** — `POST /api/samples/` takes a `file_url` that must already be in Supabase Storage. There's no endpoint to upload the audio file itself. The ingestion script handles this for Freesound content.
 - **Librosa key detection** only returns the root note (C, C#, D…) — mode (major/minor) detection is a future enhancement noted in the code.
+- **CLAP hangs on very short audio** (< ~0.1 s at 48 kHz). Samples stuck in
+  `processing` for > 5 min are likely very short clips. See LESSONS.md §8.
+  The stale-detection mechanism in `process_queue.py` will eventually reset these.
+- **MusiCNN returns `[]` for audio < 3 s** (musicnn's analysis window). This is
+  by design — the UnboundLocalError is caught and treated as "no tags".

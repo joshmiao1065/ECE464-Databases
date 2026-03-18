@@ -57,15 +57,16 @@ def musicnn():
     """
     Return the shared MusiCNNWorker instance, or None if MusiCNN is unavailable.
     The pipeline skips MusiCNN tagging gracefully when None is returned.
+
+    IMPORTANT: do NOT import musicnn.tagger here.  That module calls
+    tf.compat.v1.disable_eager_execution() at import time which would silently
+    break YAMNet (a TF2 eager-mode SavedModel) in the same process.
+    MusiCNNWorker runs musicnn in a subprocess instead — see musicnn_worker.py.
     """
     global _MUSICNN_UNAVAILABLE
     if _MUSICNN_UNAVAILABLE:
         return None
     try:
-        # Pre-test the import that predict() will need. MusiCNNWorker.__init__ is a
-        # no-op so the registry would otherwise create the worker successfully even
-        # when musicnn's TF dependency is broken, causing predict() to fail later.
-        from musicnn.tagger import top_tags  # noqa: F401
         from app.workers.musicnn_worker import MusiCNNWorker
         return MusiCNNWorker()
     except Exception as exc:
