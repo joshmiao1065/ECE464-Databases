@@ -265,6 +265,7 @@ RATE_LIMIT_BACKOFF = 65  # seconds to wait after a 429
 async def _producer(
     state: dict,
     max_requests: int,
+    max_per_query: int,
     pipeline_queue: asyncio.Queue,
     process_inline: bool,
 ) -> None:
@@ -272,11 +273,19 @@ async def _producer(
     Page through QUERIES, ingest every new sound, and put sample IDs onto
     pipeline_queue for the consumer.  Stops on rate limit or budget exhaustion
     and puts a _DONE sentinel so the consumer knows to drain and exit.
+
+    max_per_query caps how many new tracks are ingested per query term before
+    moving on.  Already-seen sounds (duplicate check) don't count toward the
+    cap — only newly inserted rows do.  Set to 0 for no limit.
     """
     from app.scraper.freesound import FreesoundClient
 
     supabase = create_client(settings.SUPABASE_URL, settings.SUPABASE_SERVICE_KEY)
     bucket = settings.SUPABASE_STORAGE_BUCKET
+
+    # Mutable counter shared between _ingest_page and the outer loop.
+    # Reset to ip["ingested"] on resume so the cap is respected across restarts.
+    query_ingested = [0]
 
     async def _ingest_page(client, query: str, page: int) -> str:
         """Fetch one search page, ingest each new sound.  Returns a status string."""
@@ -284,8 +293,8 @@ async def _producer(
             return "budget"
 
         log.info(
-            "[req %d/%d] query=%r page=%d",
-            state["requests_used"] + 1, max_requests, query, page,
+            "[req %d/%d] query=%r page=%d ingested_this_query=%d",
+            state["requests_used"] + 1, max_requests, query, page, query_ingested[0],
         )
 
         try:
@@ -311,11 +320,15 @@ async def _producer(
 
         async with AsyncSessionLocal() as db:
             for sound in results:
+                # Per-query cap: stop ingesting from this query and move on.
+                if max_per_query and query_ingested[0] >= max_per_query:
+                    return "quota"
+
                 freesound_id = sound.get("id")
                 if not freesound_id:
                     continue
 
-                # Duplicate check
+                # Duplicate check — already-seen sounds don't count toward cap.
                 if (await db.execute(
                     select(Sample).where(Sample.freesound_id == freesound_id)
                 )).scalar_one_or_none():
@@ -366,6 +379,7 @@ async def _producer(
                     )
                     await db.commit()
                     await db.refresh(sample)
+                    query_ingested[0] += 1
                     state["total_ingested"] += 1
                     log.info(
                         "[+%d] Ingested freesound:%s — %s",
@@ -382,15 +396,17 @@ async def _producer(
         return "done" if not data.get("next") else "continue"
 
     async with FreesoundClient() as client:
-        # Resume any partially-completed query first
+        # Resume any partially-completed query first.
+        # Restore the per-query counter so the cap is respected on resume.
         ip = state.get("in_progress")
         if ip:
             q, pg = ip["query"], ip.get("page", 1)
-            log.info("Resuming mid-query %r from page %d", q, pg)
+            query_ingested[0] = ip.get("ingested", 0)
+            log.info("Resuming mid-query %r from page %d (%d already ingested)", q, pg, query_ingested[0])
             while True:
                 status = await _ingest_page(client, q, pg)
-                if status in ("done", "rate_limited", "budget"):
-                    if status == "done":
+                if status in ("done", "quota", "rate_limited", "budget"):
+                    if status in ("done", "quota"):
                         state["completed"].append(q)
                         state["in_progress"] = None
                     _save_state(state)
@@ -399,7 +415,7 @@ async def _producer(
                         return
                     break
                 pg += 1
-                state["in_progress"] = {"query": q, "page": pg}
+                state["in_progress"] = {"query": q, "page": pg, "ingested": query_ingested[0]}
                 _save_state(state)
 
         # Work through the remaining queue
@@ -409,15 +425,19 @@ async def _producer(
                 break
 
             query = state["queue"].pop(0)
-            state["in_progress"] = {"query": query, "page": 1}
+            query_ingested[0] = 0
+            state["in_progress"] = {"query": query, "page": 1, "ingested": 0}
             _save_state(state)
-            log.info("── Query: %r  (%d remaining) ──", query, len(state["queue"]))
+            cap_str = f"cap={max_per_query}" if max_per_query else "no cap"
+            log.info("── Query: %r  (%d remaining, %s) ──", query, len(state["queue"]), cap_str)
 
             page = 1
             while True:
                 status = await _ingest_page(client, query, page)
-                if status in ("done", "rate_limited", "budget"):
-                    if status == "done":
+                if status in ("done", "quota", "rate_limited", "budget"):
+                    if status in ("done", "quota"):
+                        if status == "quota":
+                            log.info("Per-query cap (%d) reached for %r — moving on.", max_per_query, query)
                         state["completed"].append(query)
                         state["in_progress"] = None
                     _save_state(state)
@@ -426,7 +446,7 @@ async def _producer(
                         return
                     break
                 page += 1
-                state["in_progress"] = {"query": query, "page": page}
+                state["in_progress"] = {"query": query, "page": page, "ingested": query_ingested[0]}
                 _save_state(state)
         else:
             log.info("All queries exhausted — run again tomorrow for a fresh shuffle.")
@@ -494,7 +514,7 @@ async def _consumer(pipeline_queue: asyncio.Queue) -> None:
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-async def run(max_requests: int, reset: bool, process_inline: bool) -> None:
+async def run(max_requests: int, max_per_query: int, reset: bool, process_inline: bool) -> None:
     state = _get_state(reset)
     _save_state(state)
 
@@ -502,6 +522,7 @@ async def run(max_requests: int, reset: bool, process_inline: bool) -> None:
     log.info("Overnight ingestion starting")
     log.info("  Inline MIR processing : %s", "YES" if process_inline else "NO (use process_queue separately)")
     log.info("  Request budget        : %d/day", max_requests)
+    log.info("  Per-query cap         : %s", max_per_query if max_per_query else "unlimited")
     log.info("  Queries in queue      : %d", len(state.get("queue", [])))
     log.info("  Requests used today   : %d", state.get("requests_used", 0))
     log.info("  Total ingested (ever) : %d", state.get("total_ingested", 0))
@@ -531,14 +552,14 @@ async def run(max_requests: int, reset: bool, process_inline: bool) -> None:
         # If the producer is interrupted, it puts a _DONE sentinel and returns;
         # the consumer drains remaining queue entries before stopping.
         await asyncio.gather(
-            _producer(state, max_requests, pipeline_queue, process_inline=True),
+            _producer(state, max_requests, max_per_query, pipeline_queue, process_inline=True),
             _consumer(pipeline_queue),
         )
     else:
         # Ingestion only — no consumer needed; queue entries stay 'pending' for
         # a separate `python -m scripts.process_queue` run.
         dummy_queue: asyncio.Queue = asyncio.Queue()
-        await _producer(state, max_requests, dummy_queue, process_inline=False)
+        await _producer(state, max_requests, max_per_query, dummy_queue, process_inline=False)
         # Consume the single _DONE sentinel the producer puts at the end.
         await dummy_queue.get()
 
@@ -565,6 +586,18 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--max-per-query",
+        type=int,
+        default=15,
+        metavar="N",
+        help=(
+            "Stop ingesting from a query after N new tracks and move on to the next "
+            "query. Keeps the library diverse across all query terms rather than "
+            "downloading every result for a few popular queries. "
+            "Default: 15. Set to 0 for no limit (original behaviour)."
+        ),
+    )
+    parser.add_argument(
         "--no-process",
         action="store_true",
         help=(
@@ -579,7 +612,7 @@ def main() -> None:
         help="Discard saved state and start fresh with a new shuffled query order.",
     )
     args = parser.parse_args()
-    asyncio.run(run(args.max_requests, args.reset, process_inline=not args.no_process))
+    asyncio.run(run(args.max_requests, args.max_per_query, args.reset, process_inline=not args.no_process))
 
 
 if __name__ == "__main__":
