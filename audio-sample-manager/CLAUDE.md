@@ -7,6 +7,23 @@
 
 # Audio Sample Manager — Project Context
 
+## Repository
+
+- **GitHub:** https://github.com/joshmiao1065/ECE464-Databases
+- **Main branch:** `main` — all work is committed and pushed here
+- **Clone:** `git clone git@github.com:joshmiao1065/ECE464-Databases.git`
+
+### Recent commits (as of last CLAUDE.md update)
+| Hash | Message |
+|---|---|
+| `697cdde` | Fix MIR pipeline: connection timeout, TF eager conflict, musicnn isolation |
+| `bb86175` | ensure ingested files are properly processed by MIR suite |
+| `cd1b567` | Add concurrent-safe MIR processing to overnight ingestion |
+| `fbf4b9b` | Fix ML pipeline, auth, and social endpoints |
+| `46afc3d` | fixed migrations and DB connections for supabase pooling |
+
+Always run `git log --oneline -10` for the current state — the table above goes stale as new commits land.
+
 MIR-powered audio sample discovery platform built as a Cooper Union Databases final project.
 Producers search a library of audio samples using natural language or by uploading a reference clip.
 The backend automatically classifies every sample with BPM, key, energy, and semantic tags.
