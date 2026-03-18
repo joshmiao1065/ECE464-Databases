@@ -530,3 +530,169 @@ await db.commit()
 | Hold session open during `run_in_executor()` | Connection timeout after 30 s | Close session before slow work |
 | `selectinload` after pgvector raw query | `MissingGreenlet` | Use two-query pattern (see lesson 11) |
 | `import musicnn.tagger` in main process | Disables TF eager globally | Use subprocess isolation (see lesson 2) |
+
+---
+
+## 17. asyncpg: Always Pass datetime Objects for TIMESTAMPTZ Parameters
+
+### Symptom
+```
+asyncpg.exceptions.DataError: invalid input for query argument $1:
+'2026-03-17' (expected a datetime.date or datetime.datetime instance, got 'str')
+```
+
+### Root Cause
+asyncpg strictly type-checks bind parameters for `TIMESTAMPTZ` columns. Passing a
+plain string like `'2026-03-17'` that works in raw psql fails in asyncpg.
+
+### Fix
+Always construct a proper `datetime` object with timezone:
+```python
+from datetime import datetime, timezone
+
+cutoff = datetime(2026, 3, 17, 0, 0, 0, tzinfo=timezone.utc)
+await db.execute(text('SELECT ... WHERE created_at < :c'), {'c': cutoff})
+```
+
+This applies to both `text()` raw SQL and ORM queries. String dates are never safe
+as bind parameters to asyncpg regardless of how obvious the value looks.
+
+---
+
+## 18. Storage Pruning: Collect URLs Before Deleting DB Rows
+
+### Rule
+When deleting samples that have associated files in Supabase Storage, always
+collect the `file_url` values from the DB **before** deleting the rows.
+Once the DB row is gone, the storage path is unrecoverable.
+
+### Pattern
+```python
+# Step 1: collect URLs while rows still exist
+result = await db.execute(
+    text('SELECT file_url FROM samples WHERE created_at < :c'),
+    {'c': cutoff}
+)
+urls = [row[0] for row in result.all()]
+
+# Step 2: delete from storage
+paths = [url.replace(BASE_URL_PREFIX, '').rstrip('?') for url in urls]
+supabase.storage.from_(bucket).remove(paths)  # batch delete
+
+# Step 3: delete from DB (cascades handle child rows)
+await db.execute(text('DELETE FROM samples WHERE created_at < :c'), {'c': cutoff})
+await db.commit()
+```
+
+### Batch size
+Supabase Storage's `remove()` handles lists well. Use batches of 100 to avoid
+request size limits:
+```python
+for i in range(0, len(paths), 100):
+    supabase.storage.from_(bucket).remove(paths[i:i+100])
+```
+
+### Cascade safety
+All FK relationships on the `samples` table use `ON DELETE CASCADE`:
+`audio_embeddings`, `audio_metadata`, `sample_tags`, `processing_queue`,
+`comments`, `ratings`, `download_history`, `collection_items`, `pack_samples`.
+Deleting from `samples` is sufficient — no need to manually delete child rows.
+
+### Orphaned tags
+`tags` rows are shared across samples and do NOT cascade. After a bulk delete,
+clean orphaned tags separately:
+```python
+await db.execute(text(
+    'DELETE FROM tags WHERE id NOT IN (SELECT DISTINCT tag_id FROM sample_tags)'
+))
+await db.commit()
+```
+
+---
+
+## 19. Supabase Storage: Free Tier Limits and Misleading file_size_bytes
+
+### Storage limit
+Supabase free tier: **1 GB** of Storage. At ~150–300 KB per MP3 preview, that's
+roughly 3,000–6,000 tracks. Monitor usage in the Supabase dashboard under Storage.
+
+### file_size_bytes is the Freesound ORIGINAL file size, not the stored preview
+The `samples.file_size_bytes` column is populated from Freesound's `filesize` field,
+which refers to the full-quality original file (often 10–50 MB WAV/FLAC). The actual
+stored file is the HQ MP3 **preview** (~150–300 KB). Do not use `SUM(file_size_bytes)`
+to estimate Supabase Storage usage — it will be orders of magnitude too high.
+
+### Estimating actual storage
+Use: `num_samples × ~200 KB` as a rough estimate, or check the Supabase dashboard
+directly for ground truth.
+
+### Storage URL format
+```
+https://<project>.supabase.co/storage/v1/object/public/audio-previews/freesound/12345.mp3?
+```
+Storage path (for deletion): `freesound/12345.mp3`
+Strip the base URL prefix and trailing `?`.
+
+---
+
+## 20. Running the Worker: Use a User-Owned Terminal
+
+### Problem
+Starting `process_queue` as a background nohup process (from Claude Code's bash tool
+or a script) means it is invisible — you cannot see its output, you won't know if it
+crashes, and you have no easy way to stop it cleanly.
+
+### Rule
+Always run `process_queue` in a terminal you own:
+```bash
+cd audio-sample-manager
+source .venv/bin/activate
+python -m scripts.process_queue
+```
+
+Check it is running:
+```bash
+ps aux | grep process_queue | grep -v grep
+```
+
+If that returns nothing, the worker is dead and needs a manual restart.
+
+### Why workers die silently
+The most common causes are:
+- OOM (CLAP + YAMNet + MusiCNN together use ~3 GB RAM; other processes can crowd this)
+- SIGKILL from the OS OOM killer
+- Unhandled exception that bypasses the retry logic
+
+The stale-detection mechanism in `process_queue.py` (`--stale-minutes`, default 15)
+resets any `processing` entry whose `updated_at` is older than the cutoff back to
+`pending`, so a crashed worker does not permanently block those samples.
+
+---
+
+## 21. Bulk Ingestion Without Per-Query Cap Causes Storage Bloat
+
+### What happened
+Running `ingest_overnight.py` without `--max-per-query` downloaded every result for
+every query (up to 150 per page × multiple pages). Popular queries like "violin" or
+"kick drum" returned hundreds of nearly identical results, filling Supabase Storage
+with redundant tracks.
+
+### Fix (already in place)
+`--max-per-query` (default 15) stops ingesting from a query after N new tracks and
+moves to the next. 300 queries × 15 = ~4,500 tracks max ≈ ~700 MB.
+
+```bash
+python -m scripts.ingest_overnight --no-process               # default 15/query
+python -m scripts.ingest_overnight --no-process --max-per-query 10  # more conservative
+python -m scripts.ingest_overnight --no-process --max-per-query 0   # no cap (danger)
+```
+
+### Recovery: pruning over-ingested tracks
+If storage is exceeded, prune by date (tracks ingested before the cap was active are
+the most redundant). See lesson 18 for the deletion pattern. Key steps:
+1. Kill the worker
+2. Collect `file_url` for rows to delete
+3. Delete from Supabase Storage in batches of 100
+4. `DELETE FROM samples WHERE <condition>` — cascades handle everything
+5. `DELETE FROM tags WHERE id NOT IN (SELECT DISTINCT tag_id FROM sample_tags)`
+6. Restart the worker in a user-owned terminal

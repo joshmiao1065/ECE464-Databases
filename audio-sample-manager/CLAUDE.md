@@ -412,6 +412,11 @@ python -m scripts.ingest_freesound "kick drum" --limit 200
 python -m scripts.ingest_freesound "ambient pad" --limit 50 --process
 ```
 
+There is also `scripts/ingest_overnight.py` for bulk ingestion across ~300 curated
+queries. Always use `--no-process` and let a separately-running `process_queue`
+worker handle MIR. Always set `--max-per-query` (default 15) to avoid storage bloat.
+See the Bulk Pipeline Worker section and LESSONS.md §21.
+
 The script:
 1. Skips sounds already in the DB (checks `freesound_id`)
 2. Downloads HQ MP3 preview
@@ -509,6 +514,10 @@ frontend/src/
 
 `scripts/process_queue.py` — polls `processing_queue` for `status='pending'` rows and runs `_run_mir_pipeline` on each. Use this for samples ingested without the `--process` flag.
 
+**Always run the worker in a terminal you own** — never as a background/nohup
+process. If it dies silently you will have no idea, and samples will accumulate
+in `pending` indefinitely. See LESSONS.md §20.
+
 ```bash
 # Process current backlog then exit
 python -m scripts.process_queue --once
@@ -581,3 +590,12 @@ This endpoint is defined in `app/main.py` as `GET /api/admin/queue`.
   The stale-detection mechanism in `process_queue.py` will eventually reset these.
 - **MusiCNN returns `[]` for audio < 3 s** (musicnn's analysis window). This is
   by design — the UnboundLocalError is caught and treated as "no tags".
+- **`samples.file_size_bytes` is the Freesound original file size**, not the stored
+  MP3 preview. Do not use it to estimate Supabase Storage usage — it reads orders
+  of magnitude too high. Actual previews are ~150–300 KB each. See LESSONS.md §19.
+- **Supabase free tier Storage limit is 1 GB** (~4,000–6,000 tracks). Ingesting
+  without `--max-per-query` will breach this quickly. If storage is exceeded, see
+  LESSONS.md §18 and §21 for the safe pruning pattern.
+- **Run `process_queue` in a user-owned terminal.** Background nohup processes die
+  silently — you won't know the worker is down until you notice the queue not
+  draining. See LESSONS.md §20.
