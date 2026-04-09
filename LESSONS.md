@@ -769,3 +769,92 @@ Comments, ratings, and collections all have 0 rows. Before the demo:
 - Create a collection and add samples via the collections endpoints
 This takes ~10 minutes via Swagger UI (`http://localhost:8000/docs`) but is
 important for showing the social schema is actually being used.
+
+---
+
+## 23. Google Drive: Service Account Quota vs. Personal Google One Quota
+
+### The Non-Obvious Distinction
+A Google service account has its **own separate Drive storage quota (15 GB free)**,
+completely independent of any personal Google account. Files uploaded by a service
+account are owned by that service account and count against its quota — not yours —
+even if the destination folder is shared with your personal account.
+
+To use your personal **Google One** storage (1 TB), you must authenticate as
+yourself via **OAuth2**, not a service account.
+
+### Architecture Decision
+`app/services/gdrive.py` was migrated from service account credentials to OAuth2
+with a stored refresh token. The credentials required in `.env` are:
+
+```
+GDRIVE_CLIENT_ID       — "Desktop app" OAuth2 client from Cloud Console (free)
+GDRIVE_CLIENT_SECRET   — from Cloud Console
+GDRIVE_REFRESH_TOKEN   — generated once by scripts/gdrive_auth.py
+GDRIVE_FOLDER_ID       — Drive folder ID (unchanged)
+```
+
+No JSON key file is needed for either local dev or Railway deployment.
+
+### OAuth2 Refresh Token Lifecycle
+- Access tokens expire after **1 hour** — the `google-api-python-client` refreshes
+  them automatically using the refresh token. No manual intervention needed.
+- The refresh token itself **does not expire** unless:
+  - Unused for more than 6 consecutive months, or
+  - Manually revoked via Google Account → Security → Third-party access.
+- The `_service()` singleton calls `creds.refresh(Request())` eagerly at startup to
+  surface misconfiguration before the first real upload attempt.
+
+### One-Time Setup
+Run `scripts/gdrive_auth.py` once per environment (local, Railway):
+```bash
+python -m scripts.gdrive_auth --client-id ID --client-secret SECRET
+```
+For WSL2: the script starts a local server on port 8080; paste the printed URL into
+your Windows browser. If localhost redirect fails, re-run with `--no-server` for the
+manual copy-paste flow.
+
+### OAuth Consent Screen: Test Users
+While the Google Cloud project is in "Testing" mode, only explicitly listed test
+users can authorize the app. In Cloud Console → Google Auth Platform → Audience →
+Test users, add the Gmail account that owns your Google One plan. Without this step
+the OAuth flow returns `Error 403: access_denied`.
+
+---
+
+## 24. pip Resolver: laion-clap numpy Pin Conflict with TensorFlow 2.20
+
+### Symptom
+```
+ERROR: Cannot install ... laion-clap==1.1.4 and numpy<2.0 and >=1.26.0 because
+these package versions have conflicting dependencies.
+The conflict is caused by: laion-clap 1.1.4 depends on numpy==1.23.5
+```
+`pip install -r requirements.txt` fails entirely even though all packages are
+already installed and the app runs fine.
+
+### Root Cause
+`laion-clap==1.1.4` published its PyPI metadata with a **strict equality pin**
+`numpy==1.23.5`. TensorFlow 2.20 requires `numpy>=1.26.0`. pip's resolver sees
+these as irreconcilable and aborts, even though numpy 1.26.x works fine with
+laion-clap at runtime (the pin is overly conservative).
+
+### Fix
+Upgrade to `laion-clap==1.1.7`, which relaxed the constraint to `numpy>=1.23.5,<2.0`.
+This is compatible with TF 2.20's `>=1.26.0` requirement.
+
+The public APIs used by this project (`CLAP_Module`, `get_text_embedding`,
+`get_audio_embedding_from_filelist`, `clap_module.factory.load_state_dict`) are
+unchanged across 1.1.4 → 1.1.7.
+
+### install.sh
+A second package, `musicnn==0.1.0`, also has an incompatible numpy pin but is
+handled differently — it must be installed with `--no-deps` (see lesson 2, 3).
+`pip install -r requirements.txt` does not support per-line `--no-deps`, so
+`install.sh` at the repo root handles the full install sequence:
+```bash
+bash install.sh
+# equivalent to:
+pip install -r requirements.txt           # resolves cleanly with laion-clap 1.1.7
+pip install --no-deps musicnn==0.1.0      # bypasses musicnn's numpy pin
+```
