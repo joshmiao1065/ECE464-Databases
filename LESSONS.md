@@ -858,3 +858,88 @@ bash install.sh
 pip install -r requirements.txt           # resolves cleanly with laion-clap 1.1.7
 pip install --no-deps musicnn==0.1.0      # bypasses musicnn's numpy pin
 ```
+
+---
+
+## 25. MusiCNN Subprocess: Check Duration Before Importing TF to Prevent BrokenProcessPool
+
+### Symptom
+For very short audio clips (< a few hundred ms), the `UnboundLocalError` guard in
+lesson 3 is not enough. TF/numpy can crash at a level below Python exceptions —
+killing the subprocess process entirely and causing `BrokenProcessPool` in the parent,
+even though the `except UnboundLocalError` handler is in place.
+
+### Root Cause
+The `UnboundLocalError` guard runs after musicnn/TF are already imported, which means
+TF's C extensions may have already crashed the process at the native layer before any
+Python exception can be caught.
+
+### Fix: Pre-TF Duration Guard
+Check the clip duration with `librosa.get_duration()` **before** importing
+`musicnn.tagger` (and thus before TF is touched at all). Return `[]` immediately if
+the clip is under 3 s:
+
+```python
+def _predict_subprocess(tmp_path: str, top_k: int) -> list[str]:
+    import os as _os
+    _os.environ.setdefault("TF_USE_LEGACY_KERAS", "1")
+
+    import librosa
+    try:
+        duration = librosa.get_duration(path=tmp_path)
+        if duration < 3.0:
+            return []
+    except Exception:
+        pass  # if duration check fails, fall through and let musicnn try
+
+    from musicnn.tagger import top_tags
+    ...
+```
+
+librosa is already available in the subprocess (it's a pure-Python/numpy library
+with no TF dependency) and `get_duration()` reads only the audio header — it is
+extremely fast and does not allocate significant memory.
+
+### Why both guards are kept
+The pre-TF duration check is the primary defence. The `UnboundLocalError` catch
+(lesson 3) is kept as a secondary safety net for edge cases where the duration
+metadata is incorrect or missing.
+
+### Applies to
+`app/workers/musicnn_worker.py: _predict_subprocess`
+
+---
+
+## 26. OAuth2 Login Form: Pass Email Not Username as the `username` Field
+
+### Symptom
+After a successful `POST /api/auth/register`, the auto-login step fails with 401
+or "incorrect username or password", even though the user was just created.
+
+### Root Cause
+`POST /api/auth/token` is a standard OAuth2 password form endpoint. FastAPI's
+`OAuth2PasswordRequestForm` exposes the credential as a field named `username`, but
+the backend implementation looks up the user by **email**, not by `username` column.
+The frontend's `authStore.register()` was passing `username` (the display name) to
+`apiLogin()` as the credential — which the backend could not find.
+
+### Fix
+In `frontend/src/store/authStore.ts`, pass `email` (not `username`) to `apiLogin()`
+after registration:
+
+```ts
+// Before (broken):
+const data = await apiLogin(username, password);
+
+// After (correct):
+const data = await apiLogin(email, password);
+```
+
+Also update `frontend/src/pages/LoginPage.tsx` to:
+- Change the field label from "Username" to "Email"
+- Add `type="email"` to the input for browser validation and autofill hints
+
+### Rule
+Whenever the backend `/auth/token` handler does `user = get_by_email(form.username)`,
+the frontend **must** send email — even though the OAuth2 spec calls the field
+`username`. Document this mismatch prominently at the auth layer.
