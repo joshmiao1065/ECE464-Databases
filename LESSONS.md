@@ -931,6 +931,68 @@ TF's bundled C libraries (protobuf, abseil, etc.).
 
 ---
 
+## 27. MusiCNN Subprocess: session.run() Crash in TF 2.20 / WSL2 — Make It Non-Fatal
+
+### Symptom
+```
+I0000 ... mlir_graph_optimization_pass.cc:437] MLIR V1 optimization pass is not enabled
+[subprocess crashes]
+BrokenProcessPool: A process in the process pool was terminated abruptly
+```
+The subprocess consistently crashes on EVERY sample, right after the MLIR log line,
+during TF's first `session.run()` call. Both the initial attempt and the
+`BrokenProcessPool` retry fail. All samples end up marked `failed` in the DB even
+though `process_queue` logs them as "Done" (see the retry-logic bug in the note below).
+
+### Root Cause
+TF 2.20.0 with `tf.compat.v1.disable_eager_execution()` (required by musicnn) crashes
+in `libprotobuf.so` inside WSL2 during the first session execution. The crash is
+deterministic and not specific to any audio content — it happens on every call.
+Setting `CUDA_VISIBLE_DEVICES=""` (to avoid the WSL2 CUDA error 303 that fires just
+before the crash) may help, but is not guaranteed.
+
+This is a TF compat-v1 + WSL2 interaction bug. musicnn was written for TF 1.x/2.x;
+TF 2.20 significantly reduced v1 session support.
+
+### Fix: Non-Fatal Fallback
+Catch the second `BrokenProcessPool` (after the retry) and return `[]` instead of
+propagating. This allows the rest of the pipeline (CLAP embedding, YAMNet tags,
+Librosa features) to complete and the sample to be marked `done`, rather than
+failing the entire pipeline and producing no output at all.
+
+```python
+try:
+    executor = _get_executor()
+    future = executor.submit(_predict_subprocess, tmp_path, top_k)
+    return future.result(timeout=300)
+except concurrent.futures.process.BrokenProcessPool:
+    with _executor_lock:
+        _executor = None
+    try:
+        executor = _get_executor()
+        future = executor.submit(_predict_subprocess, tmp_path, top_k)
+        return future.result(timeout=300)
+    except concurrent.futures.process.BrokenProcessPool:
+        log.error("MusiCNN retry also failed — returning [] so pipeline can complete.")
+        with _executor_lock:
+            _executor = None
+        return []
+```
+
+### Side Effect: Retry-Logic Bug in run_worker
+`_run_mir_pipeline` catches all exceptions internally, marks the DB entry as `failed`,
+and returns normally. `run_worker` sees a clean return and logs "[job] Done", treating
+the sample as successfully processed even though it's marked `failed`. This means the
+retry_count in `run_worker` never increments and the sample never retries via that path.
+With the non-fatal fix above, the pipeline succeeds (CLAP + YAMNet + Librosa) and the
+sample is correctly marked `done` — making the retry-logic bug moot for now.
+
+### Affected scope
+Only musicnn tags are missing; CLAP (search embeddings), YAMNet tags, BPM/key/energy
+features all work correctly. Samples still become searchable and get yamnet-sourced tags.
+
+---
+
 ## 26. OAuth2 Login Form: Pass Email Not Username as the `username` Field
 
 ### Symptom
