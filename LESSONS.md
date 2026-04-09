@@ -861,52 +861,73 @@ pip install --no-deps musicnn==0.1.0      # bypasses musicnn's numpy pin
 
 ---
 
-## 25. MusiCNN Subprocess: Check Duration Before Importing TF to Prevent BrokenProcessPool
+## 25. MusiCNN Subprocess: Importing librosa Before TF Causes libprotobuf Segfault
 
 ### Symptom
-For very short audio clips (< a few hundred ms), the `UnboundLocalError` guard in
-lesson 3 is not enough. TF/numpy can crash at a level below Python exceptions —
-killing the subprocess process entirely and causing `BrokenProcessPool` in the parent,
-even though the `except UnboundLocalError` handler is in place.
+```
+python[NNNN]: segfault at 0 ip 0x... sp 0x... error 4 in libprotobuf.so.25.3.0
+concurrent.futures.process.BrokenProcessPool: A process in the process pool was
+terminated abruptly while the future was running or pending.
+```
+The musicnn subprocess crashes EVERY TIME, making all queue entries fail.
 
 ### Root Cause
-The `UnboundLocalError` guard runs after musicnn/TF are already imported, which means
-TF's C extensions may have already crashed the process at the native layer before any
-Python exception can be caught.
+In a `spawn`-context subprocess, import order matters for native shared libraries.
+If `import librosa` (which pulls in numpy C extensions, scipy, soundfile, etc.)
+runs **before** `from musicnn.tagger import top_tags` (which initialises TensorFlow),
+the shared-library loader binds `libprotobuf.so` to the version brought in by
+librosa's dependency chain. TF then tries to use its own incompatible protobuf API
+against that version → segfault at TF initialisation time.
 
-### Fix: Pre-TF Duration Guard
-Check the clip duration with `librosa.get_duration()` **before** importing
-`musicnn.tagger` (and thus before TF is touched at all). Return `[]` immediately if
-the clip is under 3 s:
+This is deterministic: it crashes on the very first subprocess call, 100% of the
+time. No amount of retry helps.
+
+### Confirmed by
+```
+dmesg: python[NNNN]: segfault at 0 ip ... in libprotobuf.so.25.3.0
+```
+(Two separate subprocess attempts, same crash address — deterministic library
+conflict, not a race or memory issue.)
+
+### Fix: Duration Guard Lives in the Parent Process
+Do NOT import librosa inside `_predict_subprocess`. Keep the subprocess as clean as
+possible — only `os.environ` setup + `musicnn.tagger`. Move the duration check to
+`MusiCNNWorker.predict()` in the parent process, using `soundfile` (already
+installed as a librosa transitive dependency) to read the audio header from bytes:
 
 ```python
+# In MusiCNNWorker.predict() — parent process, librosa already loaded safely:
+import soundfile as sf
+import io
+try:
+    with sf.SoundFile(io.BytesIO(audio_bytes)) as f:
+        duration = len(f) / f.samplerate
+    if duration < 3.0:
+        return []
+except Exception:
+    pass  # unknown format — let musicnn try
+
+# Then write temp file and submit to subprocess as before.
+```
+
+```python
+# In _predict_subprocess — subprocess, must stay TF-only:
 def _predict_subprocess(tmp_path: str, top_k: int) -> list[str]:
     import os as _os
     _os.environ.setdefault("TF_USE_LEGACY_KERAS", "1")
-
-    import librosa
-    try:
-        duration = librosa.get_duration(path=tmp_path)
-        if duration < 3.0:
-            return []
-    except Exception:
-        pass  # if duration check fails, fall through and let musicnn try
-
+    # NO librosa here — see above
     from musicnn.tagger import top_tags
     ...
 ```
 
-librosa is already available in the subprocess (it's a pure-Python/numpy library
-with no TF dependency) and `get_duration()` reads only the audio header — it is
-extremely fast and does not allocate significant memory.
-
-### Why both guards are kept
-The pre-TF duration check is the primary defence. The `UnboundLocalError` catch
-(lesson 3) is kept as a secondary safety net for edge cases where the duration
-metadata is incorrect or missing.
+### Generalisation
+**Never import any library that loads numpy/scipy native extensions before
+TensorFlow in a spawned subprocess.** The shared-library initialisation order in
+`spawn` processes is different from the parent and can bind the wrong version of
+TF's bundled C libraries (protobuf, abseil, etc.).
 
 ### Applies to
-`app/workers/musicnn_worker.py: _predict_subprocess`
+`app/workers/musicnn_worker.py`
 
 ---
 
