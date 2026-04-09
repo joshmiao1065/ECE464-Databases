@@ -931,65 +931,66 @@ TF's bundled C libraries (protobuf, abseil, etc.).
 
 ---
 
-## 27. MusiCNN Subprocess: session.run() Crash in TF 2.20 / WSL2 — Make It Non-Fatal
+## 27. MusiCNN Subprocess: session.run() Crash — Root Cause: Anaconda libprotobuf Conflict
 
 ### Symptom
 ```
 I0000 ... mlir_graph_optimization_pass.cc:437] MLIR V1 optimization pass is not enabled
-[subprocess crashes]
-BrokenProcessPool: A process in the process pool was terminated abruptly
+Fatal Python error: Segmentation fault
+  File "tensorflow/python/client/session.py", line 1483 in _call_tf_sessionrun
+  ...
+  File "musicnn/tagger.py", line 60 in top_tags
 ```
-The subprocess consistently crashes on EVERY sample, right after the MLIR log line,
+The musicnn subprocess crashes on every sample, right after the MLIR log line,
 during TF's first `session.run()` call. Both the initial attempt and the
-`BrokenProcessPool` retry fail. All samples end up marked `failed` in the DB even
-though `process_queue` logs them as "Done" (see the retry-logic bug in the note below).
+`BrokenProcessPool` retry fail.
 
-### Root Cause
-TF 2.20.0 with `tf.compat.v1.disable_eager_execution()` (required by musicnn) crashes
-in `libprotobuf.so` inside WSL2 during the first session execution. The crash is
-deterministic and not specific to any audio content — it happens on every call.
-Setting `CUDA_VISIBLE_DEVICES=""` (to avoid the WSL2 CUDA error 303 that fires just
-before the crash) may help, but is not guaranteed.
+### Root Cause: Anaconda libprotobuf ABI conflict
 
-This is a TF compat-v1 + WSL2 interaction bug. musicnn was written for TF 1.x/2.x;
-TF 2.20 significantly reduced v1 session support.
+When the subprocess runs with **Anaconda's Python** (`~/anaconda3/bin/python3.12`),
+the dynamic linker finds `~/anaconda3/lib/libprotobuf.so.25.3.0` on the library
+search path. TF 2.20 was compiled against a DIFFERENT build of `libprotobuf.so.25.3.0`
+(the PyPI wheel builder's build). Although both files carry the same soname version
+`25.3.0`, they have different internal struct layouts (different compiler flags, inline
+thresholds, or Abseil dependency versions). When `sess.run()` tries to serialise
+`RunOptions` through the Anaconda build of libprotobuf, a required vtable pointer or
+internal struct member is NULL → SIGSEGV at offset `0x16d5fd`.
 
-### Fix: Non-Fatal Fallback
-Catch the second `BrokenProcessPool` (after the retry) and return `[]` instead of
-propagating. This allows the rest of the pipeline (CLAP embedding, YAMNet tags,
-Librosa features) to complete and the sample to be marked `done`, rather than
-failing the entire pipeline and producing no output at all.
-
-```python
-try:
-    executor = _get_executor()
-    future = executor.submit(_predict_subprocess, tmp_path, top_k)
-    return future.result(timeout=300)
-except concurrent.futures.process.BrokenProcessPool:
-    with _executor_lock:
-        _executor = None
-    try:
-        executor = _get_executor()
-        future = executor.submit(_predict_subprocess, tmp_path, top_k)
-        return future.result(timeout=300)
-    except concurrent.futures.process.BrokenProcessPool:
-        log.error("MusiCNN retry also failed — returning [] so pipeline can complete.")
-        with _executor_lock:
-            _executor = None
-        return []
+Confirmed with `faulthandler`:
 ```
+Extension modules loaded before crash: numpy.core._multiarray_umath, ...,
+  google._upb._message, scipy.*, pyarrow.lib, pandas.*, numba.*, ...
+```
+`ctypes.util.find_library('protobuf')` returns `~/anaconda3/lib/libprotobuf.so.25.3.0`.
 
-### Side Effect: Retry-Logic Bug in run_worker
-`_run_mir_pipeline` catches all exceptions internally, marks the DB entry as `failed`,
-and returns normally. `run_worker` sees a clean return and logs "[job] Done", treating
-the sample as successfully processed even though it's marked `failed`. This means the
-retry_count in `run_worker` never increments and the sample never retries via that path.
-With the non-fatal fix above, the pipeline succeeds (CLAP + YAMNet + Librosa) and the
-sample is correctly marked `done` — making the retry-logic bug moot for now.
+The **system Python** (`/usr/bin/python3`) does not have `~/anaconda3/lib` on its
+dynamic-linker search path, so TF uses the correct system libprotobuf and succeeds.
+Confirmed: `/usr/bin/python3 -c "from musicnn.tagger import top_tags; top_tags(...)"`
+works perfectly on the same samples that crash under the Anaconda interpreter.
 
-### Affected scope
-Only musicnn tags are missing; CLAP (search embeddings), YAMNet tags, BPM/key/energy
-features all work correctly. Samples still become searchable and get yamnet-sourced tags.
+### Fix: Use /usr/bin/python3 for the musicnn subprocess
+
+Replace the `ProcessPoolExecutor` (which inherits `sys.executable` = Anaconda Python)
+with a **persistent `/usr/bin/python3` subprocess** communicating over stdin/stdout
+JSON IPC:
+
+- `app/workers/_musicnn_proc.py` — the worker script; loads TF once, then loops
+  reading `{"path":..., "top_k":...}` from stdin and writing `{"tags":[...]}` to stdout.
+- `app/workers/musicnn_worker.py` — starts `_musicnn_proc.py` via
+  `subprocess.Popen(['/usr/bin/python3', ...])`, manages lifecycle (restart on crash),
+  and applies a per-call timeout via a background reader thread.
+
+TF and the MTT_musicnn checkpoint load once at subprocess start (~3–5 s cold start).
+Subsequent calls are fast (~1–2 s each). The subprocess restarts automatically if it
+dies; after two consecutive failures predict() returns [] so the rest of the pipeline
+(CLAP, YAMNet, Librosa) can still complete.
+
+### Lesson
+If you have Anaconda installed alongside pip TF, spawned subprocesses using Anaconda's
+Python will inherit its `lib/` directory on the dynamic-linker search path. This can
+silently substitute Anaconda's builds of shared libraries (protobuf, absl, etc.) for
+the ones TF was compiled against — even when both have the same soname version. Always
+use `/usr/bin/python3` (or a clean virtual environment) for subprocesses that load TF.
 
 ---
 
