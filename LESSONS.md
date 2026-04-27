@@ -994,6 +994,97 @@ use `/usr/bin/python3` (or a clean virtual environment) for subprocesses that lo
 
 ---
 
+## 28. Railway Deployment: CPU-Only PyTorch is Non-Negotiable
+
+### Problem
+`torch==2.3.0` on PyPI defaults to the CUDA wheel (~2.5 GB). On a Railway Hobby
+instance (CPU-only) this either times out the build step or consumes unnecessary
+disk space. The CUDA wheel installs fine but adds 2–3 minutes to every deploy.
+
+### Fix
+Use the PyTorch CPU wheel index in `requirements-railway.txt`:
+```
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.3.0+cpu
+torchvision==0.18.0+cpu
+```
+And override Nixpacks' default install step via `nixpacks.toml`:
+```toml
+[phases.install]
+cmds = ["pip install -r requirements-railway.txt"]
+```
+This reduces the PyTorch install from ~2.5 GB to ~175 MB.
+
+### What Railway needs vs. what stays local
+Railway only runs the FastAPI server + CLAP (for text/audio search). YAMNet,
+MusiCNN, and `process_queue` all run locally. `requirements-railway.txt` omits
+TF entirely — its workers never load on Railway.
+
+---
+
+## 29. User File Upload: Run gdrive.upload_audio() in a Thread Executor
+
+### Problem
+`gdrive.upload_audio()` uses `google-api-python-client` which is synchronous.
+Calling it directly inside an `async def` handler blocks the uvicorn event loop
+for the entire upload duration (Drive API call can take 1–5 seconds).
+
+### Fix
+Run the blocking Drive call in a thread pool:
+```python
+loop = asyncio.get_running_loop()
+gdrive_file_id, public_url = await loop.run_in_executor(
+    None, gdrive.upload_audio, audio_bytes, drive_filename, mime
+)
+```
+This frees the event loop to serve other requests while the Drive upload
+completes in a background thread. Same pattern as the existing `run_in_executor`
+calls for CLAP and Librosa in `_run_mir_pipeline`.
+
+---
+
+## 30. FastAPI File Upload: Validate Extension, Not Content-Type
+
+### Problem
+Browsers send inconsistent `Content-Type` headers for audio files:
+- Chrome: `audio/mpeg` for MP3
+- Safari: `audio/x-m4a` for M4A
+- Some: `application/octet-stream` for anything
+
+### Fix
+Validate by file extension, not content type header:
+```python
+ext = Path(file.filename or "").suffix.lower()
+if ext not in _ALLOWED_EXTENSIONS:
+    raise HTTPException(status_code=415, detail=...)
+```
+Use a `_MIME_BY_EXT` dict to determine the Drive mimetype from the extension,
+ignoring what the client claims the content-type is.
+
+---
+
+## 31. Railway CORS: Make Origins Configurable via Env Var
+
+### Problem
+Hardcoding CORS origins in `app/main.py` means you need a code change + redeploy
+every time you add a new allowed origin (e.g. when you get the Vercel URL).
+
+### Fix
+Store origins as a comma-separated env var `ALLOWED_ORIGINS` and parse at startup:
+```python
+_origins = [o.strip() for o in settings.ALLOWED_ORIGINS.split(",") if o.strip()]
+app.add_middleware(CORSMiddleware, allow_origins=_origins, ...)
+```
+Set `ALLOWED_ORIGINS` in Railway's dashboard Variables tab. Changing it there
+triggers a redeploy without touching code.
+
+### Two-pass deploy order
+1. Deploy Railway backend with `ALLOWED_ORIGINS=http://localhost:5173`
+2. Deploy Vercel frontend → get the `.vercel.app` URL
+3. Update Railway's `ALLOWED_ORIGINS` to include the Vercel URL → auto-redeploy
+
+---
+
 ## 26. OAuth2 Login Form: Pass Email Not Username as the `username` Field
 
 ### Symptom
