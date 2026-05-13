@@ -1346,3 +1346,54 @@ via RETURNING; the refresh is redundant and crosses a PgBouncer boundary.
 
 ### Applied to
 `scripts/ingest_overnight.py` — `_install_direct_engine()` called at `run()` startup.
+
+---
+
+## 38. Railway Crash Loop: Loading CLAP at Startup via `on_event("startup")` Causes OOM
+
+### Symptom
+Railway deploy enters a restart loop immediately after `git push`.  Logs show:
+```
+INFO:     Started server process [1]
+INFO:     Waiting for application startup.
+[torch/huggingface warnings for CLAP weight download]
+INFO:     Started server process [1]   ← process killed before startup completes
+INFO:     Waiting for application startup.
+```
+The server never reaches `INFO: Application startup complete.`  `/health` returns
+502 or times out indefinitely.
+
+### Root Cause
+A `@app.on_event("startup")` handler loaded CLAP (~900 MB) via
+`await loop.run_in_executor(None, registry.clap)` before uvicorn finished startup.
+Railway interprets the process as unhealthy if it does not begin serving within a
+fixed timeout; the OOM kill (or slow load exceeding that timeout) triggers a restart.
+
+### Fix
+**Remove the startup warm-up entirely.**  CLAP loads lazily on the first
+`POST /api/search/text` or `/api/search/audio` request.  Wrap those calls in
+try/except and return `503 Service Unavailable` on any exception so a CLAP failure
+does not crash the server process.
+
+```python
+# search.py — safe lazy-load pattern
+def _clap_encode_text(text: str) -> list[float]:
+    return registry.clap().encode_text(text)
+
+@router.post("/text")
+async def search_by_text(payload, db, current_user):
+    loop = asyncio.get_running_loop()
+    try:
+        vector = await loop.run_in_executor(None, _clap_encode_text, payload.query)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Search unavailable: {exc}")
+    ...
+```
+
+### Trade-off
+The first search after a Railway restart is slow (~30 s) while CLAP loads.
+This is acceptable for a demo; do **not** try to hide it with a warm-up task.
+
+### Rule
+Never load large ML models (>500 MB) in a FastAPI startup handler on Railway.
+The server must start and pass its health check before doing any heavy work.
