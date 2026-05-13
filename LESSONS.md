@@ -1448,3 +1448,90 @@ Add only the **stable aliases** to Railway's `ALLOWED_ORIGINS`:
 
 These aliases always point to the latest production deployment — no need to
 update ALLOWED_ORIGINS on every redeploy.
+
+---
+
+## 40. `railway up` from WSL/OneDrive DrvFS: CRLF Files → Null-Byte SyntaxError
+
+### Symptom
+After `railway up` from a WSL path under `/mnt/c/…` (OneDrive), Railway crashes
+on startup with:
+```
+SyntaxError: source code string cannot contain null bytes
+File "/app/app/models/__init__.py", line 2, in <module>
+    from .user import User
+```
+The local files are clean (no null bytes). `file app/models/user.py` shows
+"ASCII text executable". The error reproduces on every `railway up` from that path
+but goes away if you deploy from a native Linux path.
+
+### Root Cause
+OneDrive stores files with CRLF (`\r\n`) line endings on the Windows NTFS filesystem.
+WSL DrvFS exposes those files as-is (CRLF). When `railway up` archives from the DrvFS
+path, it bundles CRLF files. During the railpack/nixpacks Docker build, some layer
+processing corrupts the CRLF bytes into null bytes — the exact mechanism is internal
+to railpack but consistently reproducible.
+
+### Fix (immediate)
+Deploy from a clean git archive on native Linux instead of the DrvFS path:
+```bash
+mkdir -p /tmp/audio-sample-manager
+git archive HEAD | tar -x -C /tmp/audio-sample-manager
+cd /tmp/audio-sample-manager
+railway up --project <id> --service <id> --environment <id> --ci
+```
+This produces LF-only files and eliminates the null-byte corruption.
+
+### Fix (permanent)
+Add `.gitattributes` to force LF for all text files in the repo. This normalises
+line endings in git and in any downstream tool that respects git attributes:
+```
+* text=auto eol=lf
+*.py text eol=lf
+```
+After this, `git checkout` on Windows will still produce CRLF on disk (DrvFS), but
+tools that read the git object (like `git archive`) produce LF — safe for deployment.
+
+---
+
+## 41. asyncpg + PgBouncer Transaction Mode: NullPool Required on Railway
+
+### Symptom
+Railway FastAPI server crashes immediately after an OOM restart with:
+```
+DuplicatePreparedStatementError: prepared statement "__asyncpg_stmt_1__" already exists
+InvalidSQLStatementNameError: prepared statement "__asyncpg_stmt_1a__" does not exist
+```
+All endpoints return 500. Setting `statement_cache_size=0` (the documented fix) does
+not help.
+
+### Root Cause
+asyncpg uses named prepared statements per connection. PgBouncer transaction mode
+re-uses server connections between asyncpg client connections. After an OOM crash,
+asyncpg connections are abruptly dropped. PgBouncer's server connections retain the
+stale prepared statements. The new asyncpg pool starts with `pool_size=10` and
+initialises all 10 connections **concurrently**. Multiple asyncpg connections are
+assigned the same PgBouncer server connection and both try to create
+`__asyncpg_stmt_0__` → `DuplicatePreparedStatementError`.
+
+`statement_cache_size=0` only disables caching; asyncpg still creates named prepared
+statements for every execute call. With a shared server connection, the names collide.
+
+### Fix
+Switch `database.py` to `NullPool`. Each request opens its own asyncpg connection;
+there is no concurrent pool initialisation and no shared server connection:
+```python
+from sqlalchemy.pool import NullPool
+engine = create_async_engine(
+    settings.DATABASE_URL,
+    echo=False,
+    poolclass=NullPool,                     # replaces pool_size=10/max_overflow=20
+    connect_args={"statement_cache_size": 0},
+)
+```
+
+### Constraint
+Railway free tier cannot reach Supabase direct PostgreSQL on port 5432 (ENETUNREACH).
+Supabase session-mode pooler (same host, port 5432) is also unreachable from Railway.
+Only port 6543 (transaction mode) works. NullPool + port 6543 is the viable option
+for Railway.
