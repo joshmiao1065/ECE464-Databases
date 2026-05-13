@@ -1397,3 +1397,54 @@ This is acceptable for a demo; do **not** try to hide it with a warm-up task.
 ### Rule
 Never load large ML models (>500 MB) in a FastAPI startup handler on Railway.
 The server must start and pass its health check before doing any heavy work.
+
+---
+
+## 39. Vercel GitHub Integration: rootDirectory Must Be Set or It Tries to Install Python
+
+### Symptom
+GitHub-triggered Vercel builds fail immediately:
+```
+Using CPython 3.14.3
+× No solution found when resolving dependencies:
+╰─▶ Because torch==2.5.1+cpu has no wheels with a matching Python ABI tag (cp314)
+```
+Manual `vercel --prod` from `frontend/` succeeds; GitHub pushes always fail.
+
+### Root Cause
+The Vercel project's `rootDirectory` was `null`.  When Vercel clones the GitHub
+repo at the repo root, it finds `requirements.txt` (the Python backend) and
+runs `uv install`, which fails because PyTorch has no Python 3.14 wheels.
+
+Manual CLI deploys from `frontend/` work because the CLI uploads only that
+directory's files — the Python `requirements.txt` never enters the picture.
+
+### Fix
+Set `rootDirectory` to `frontend` (relative to the repo root) via the REST API:
+
+```bash
+VERCEL_TOKEN=$(cat ~/.local/share/com.vercel.cli/auth.json | python3 -c \
+  "import sys,json; d=json.load(sys.stdin); print(list(d.values())[0])")
+
+curl -X PATCH "https://api.vercel.com/v9/projects/<projectId>?teamId=<teamId>" \
+  -H "Authorization: Bearer $VERCEL_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"rootDirectory": "frontend", "framework": "vite"}'
+```
+
+After this, every GitHub push builds from `frontend/`, finds `package.json`,
+and runs `vite build` correctly.
+
+### Rule
+Whenever a Vercel project is connected to a GitHub repo that contains both a
+Python backend and a Node.js frontend in a subdirectory, always set
+`rootDirectory` explicitly — never leave it `null`.
+
+### CORS corollary
+Each new Vercel deployment gets a unique preview URL (`-HASH-team.vercel.app`).
+Add only the **stable aliases** to Railway's `ALLOWED_ORIGINS`:
+- `https://audio-sample-manager.vercel.app`
+- `https://audio-sample-manager-josh-miao-s-projects.vercel.app`
+
+These aliases always point to the latest production deployment — no need to
+update ALLOWED_ORIGINS on every redeploy.
