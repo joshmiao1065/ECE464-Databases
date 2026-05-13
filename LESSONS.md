@@ -1241,3 +1241,54 @@ Re-type (don't paste) the value in Railway's Variables field as a single line:
 http://localhost:5173,https://audio-sample-manager-6ouyzyyoo-josh-miao-s-projects.vercel.app
 ```
 No spaces around the comma, no line breaks anywhere in the string.
+
+
+---
+
+## 36. `DuplicatePreparedStatementError` in `ingest_overnight.py` — PgBouncer + Concurrent asyncio.gather
+
+### Symptom
+```
+asyncpg.exceptions.DuplicatePreparedStatementError: prepared statement "__asyncpg_stmt_1__" already exists
+[SQL: select pg_catalog.version()]
+```
+Raised during `scripts/ingest_overnight.py` when `--process` (inline MIR) is
+active. Only occurs when `_producer` and `_consumer` run concurrently via
+`asyncio.gather`.
+
+### Root Cause
+`asyncio.gather(_producer(...), _consumer(...))` schedules both coroutines
+concurrently. Each makes a database call shortly after startup, causing
+SQLAlchemy to create two pool connections at nearly the same time. Both
+connections go through Supabase's PgBouncer pooler (transaction mode). PgBouncer
+recycles connections, so it can route both to the same underlying PostgreSQL
+backend connection. SQLAlchemy's asyncpg dialect runs `select pg_catalog.version()`
+via a named prepared statement (`__asyncpg_stmt_1__`) during its per-connection
+initialization. When two connections share the same backend connection, the second
+`PREPARE __asyncpg_stmt_1__` fails because the first already created it.
+
+`statement_cache_size=0` in `connect_args` disables asyncpg's LRU cache, but the
+dialect initialization still goes through `_prepare_and_execute` with a named
+statement — it does not use the simple query protocol. So the error persists.
+
+### Fix
+Pre-warm one pool connection **before** `asyncio.gather`. This forces dialect
+initialization (the `select pg_catalog.version()` round-trip) to complete
+single-threaded. By the time `asyncio.gather` starts both tasks, the engine is
+already initialized and subsequent connections skip the version check entirely:
+
+```python
+# In ingest_overnight.py run(), just before asyncio.gather:
+from app.database import engine   # already imported at module level now
+
+async with engine.connect() as _conn:
+    pass  # triggers dialect init single-threaded; subsequent connections skip it
+
+await asyncio.gather(_producer(...), _consumer(...))
+```
+
+Also add `engine` to the module-level import: `from app.database import AsyncSessionLocal, engine`.
+
+### Applied to
+`scripts/ingest_overnight.py` — `run()` function, immediately before the
+`asyncio.gather` call inside the `if process_inline:` branch.
