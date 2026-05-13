@@ -1292,3 +1292,57 @@ Also add `engine` to the module-level import: `from app.database import AsyncSes
 ### Applied to
 `scripts/ingest_overnight.py` — `run()` function, immediately before the
 `asyncio.gather` call inside the `if process_inline:` branch.
+
+---
+
+## 37. asyncpg + PgBouncer Transaction Mode: statement_cache_size=0 Is Not Enough
+
+### Symptom
+`DuplicatePreparedStatementError: prepared statement "__asyncpg_stmt_9__" already exists`
+(or `InvalidSQLStatementNameError: ... does not exist`) when running two concurrent
+`asyncio.gather` tasks that both open SQLAlchemy `AsyncSession` connections through
+Supabase's PgBouncer pooler (port 6543).  Occurs even though `statement_cache_size=0`
+is set in `connect_args`.
+
+### Root Cause
+`statement_cache_size=0` disables asyncpg's *LRU cache* but does **not** prevent
+asyncpg from creating **named** prepared statements.  Every SQLAlchemy ORM query still
+calls `asyncpg.connection.prepare()`, which generates a name like `__asyncpg_stmt_N__`
+where N is a per-connection hex counter starting from 1.
+
+Two concurrent connections (e.g. producer + consumer in `asyncio.gather`) each start
+their counter at 1.  When both reach counter N=9 at the same moment, PgBouncer
+(transaction mode) can route both to the same PostgreSQL backend connection.  Both
+send `PREPARE __asyncpg_stmt_9__` → duplicate error.
+
+`db.refresh(sample)` after `db.commit()` triggers a SELECT that crosses a PgBouncer
+transaction boundary (backend was returned to pool on COMMIT), producing the inverse
+error: `InvalidSQLStatementNameError: ... does not exist`.
+
+### Fix
+Bypass PgBouncer for scripts by connecting directly to PostgreSQL (port 5432 instead
+of 6543).  Each asyncpg connection gets a dedicated backend → no naming conflict.
+Use `NullPool` so SQLAlchemy doesn't add its own connection layer on top.
+
+```python
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+from sqlalchemy.pool import NullPool
+from app.config import settings
+
+url = settings.DATABASE_URL.replace(":6543/", ":5432/")
+direct_engine = create_async_engine(url, poolclass=NullPool,
+                                    connect_args={"statement_cache_size": 0})
+DirectSession = async_sessionmaker(direct_engine, expire_on_commit=False,
+                                   class_=AsyncSession)
+```
+
+Also patch both `app.database.AsyncSessionLocal` and `app.routers.samples.AsyncSessionLocal`
+(the latter has its own reference from the `from app.database import AsyncSessionLocal`
+import at module load time).
+
+Also remove any `await db.refresh(obj)` calls that follow `await db.commit()`.
+`expire_on_commit=False` + `db.flush()` already populates server-generated PKs
+via RETURNING; the refresh is redundant and crosses a PgBouncer boundary.
+
+### Applied to
+`scripts/ingest_overnight.py` — `_install_direct_engine()` called at `run()` startup.
