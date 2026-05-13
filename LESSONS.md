@@ -1597,3 +1597,38 @@ DEALLOCATED because asyncpg with `statement_cache_size=0` simply doesn't cache
 them — it doesn't explicitly deallocate either). For a demo project with few
 restarts this is fine. For production, run `DEALLOCATE ALL` on connect or use
 Supabase's session-mode pooler (port 5432, accessible from most non-Railway hosts).
+
+---
+
+## 43. CLAP OOM on Railway Free Tier Causes Silent Frontend Failure
+
+### Symptom
+Text search on the deployed frontend appeared to return "the same samples as the home page."
+The UI showed no error; submitting a search query left the browse grid unchanged.
+
+### Root Cause
+`POST /api/search/text` loads LAION-CLAP (~900 MB weights) on first call via `registry.clap()`.
+Railway's free tier hard-limits processes to 512 MB. The OS OOMs the process;
+Railway returns 502 before FastAPI can emit its own 503.
+
+The original `SearchBar.handleTextSearch` only had a `finally` block — no `catch`.
+When Axios threw on the 502, `onResults()` was never called, so BrowsePage's
+`searched` state stayed `false` and the samples grid kept showing the pre-search
+home page list. The user read this as "search returned the home page samples."
+
+### Fix
+- Added `catch` in `SearchBar` for both text and audio search handlers.
+- On 502/503, surface a specific message: "Semantic search needs CLAP, which can't
+  run on the free-tier server (out of memory). Run the backend locally to use text
+  search."
+- Added `onError` prop to `SearchBar`; `BrowsePage` manages an `error` state and
+  renders a dismissable red banner.
+
+### How to actually use text/audio search
+CLAP must be running in the same process that handles the search request.
+Options in order of preference:
+1. Run backend locally (`uvicorn app.main:app --reload`) → test at localhost:8000/docs.
+2. Upgrade Railway to Starter plan ($5/mo, 8 GB RAM) → CLAP loads normally.
+The 776 audio embeddings already in `audio_embeddings` were generated locally during
+ingestion — the stored vectors are fine; only the *query* embedding path is broken
+on Railway.
