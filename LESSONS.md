@@ -1535,3 +1535,65 @@ Railway free tier cannot reach Supabase direct PostgreSQL on port 5432 (ENETUNRE
 Supabase session-mode pooler (same host, port 5432) is also unreachable from Railway.
 Only port 6543 (transaction mode) works. NullPool + port 6543 is the viable option
 for Railway.
+
+---
+
+## 42. asyncpg + PgBouncer: DuplicatePreparedStatementError Persists After Railway Restart
+
+### Problem
+Even with `NullPool` and `statement_cache_size=0`, Railway deployments get
+`DuplicatePreparedStatementError` on every restart. The error appears on the
+very first request after a redeploy:
+```
+prepared statement "__asyncpg_stmt_1__" already exists
+[SQL: select pg_catalog.version()]
+```
+
+### Root Cause
+asyncpg 0.29.0 uses a **module-level global counter** (`_uid`) for prepared statement
+names — format `__asyncpg_{prefix}_{_uid:x}__`. This counter resets to 0 when the
+Railway process restarts (new deployment).
+
+PgBouncer's **server connections persist** across Railway process restarts — they're
+maintained by Supabase's PgBouncer, not by the Railway container. After a restart:
+1. The old process prepared `__asyncpg_stmt_1__` on server connection S1.
+2. PgBouncer retained S1 (it's still alive on Supabase's side).
+3. New Railway process starts, `_uid` resets to 0.
+4. First request gets S1 via PgBouncer, tries to prepare `__asyncpg_stmt_1__`.
+5. S1 already has that statement → `DuplicatePreparedStatementError`.
+
+`NullPool` prevents the *concurrent pool-init* conflict (§41) but not the
+*cross-restart* conflict.
+
+### Fix
+Monkey-patch asyncpg's `Connection._get_unique_id` in `app/database.py` before
+engine creation to add a **per-process random base offset**:
+
+```python
+import uuid
+import asyncpg.connection as _asyncpg_conn
+
+_stmt_base = int(uuid.uuid4().hex[:12], 16)
+
+def _unique_stmt_name(self, prefix):
+    _asyncpg_conn._uid += 1
+    return f"__{prefix}_{_stmt_base + _asyncpg_conn._uid:x}__"
+
+_asyncpg_conn.Connection._get_unique_id = _unique_stmt_name
+```
+
+Each Railway restart generates a new random 48-bit base. The chance of the new
+base colliding with any leftover statement name from a previous run is negligible.
+
+### Why not DEALLOCATE ALL?
+An alternative is to run `DEALLOCATE ALL` on each new asyncpg connection.
+This is harder to wire in cleanly because SQLAlchemy's `connect` event fires
+synchronously and the async asyncpg connection can't be awaited there.
+The monkey-patch is simpler and equally correct.
+
+### Long-term note
+Prepared statements accumulate on PgBouncer server connections (they're never
+DEALLOCATED because asyncpg with `statement_cache_size=0` simply doesn't cache
+them — it doesn't explicitly deallocate either). For a demo project with few
+restarts this is fine. For production, run `DEALLOCATE ALL` on connect or use
+Supabase's session-mode pooler (port 5432, accessible from most non-Railway hosts).
