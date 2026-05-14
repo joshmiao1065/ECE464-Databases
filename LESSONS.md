@@ -1813,3 +1813,75 @@ PostgreSQL rewrites the entire table when adding a NOT NULL column with a non-tr
 DEFAULT (prior to PG 11 it always rewrites; after PG 11 it can be instant for simple
 defaults but a full rewrite still happens for CHECK constraints added simultaneously).
 Splitting into add-nullable → backfill → alter is safer and clearer in Alembic diffs.
+
+---
+
+## 51. alembic/env.py needs the same asyncpg monkey-patch as database.py
+
+### Symptom
+`alembic upgrade head` fails with `DuplicatePreparedStatementError: prepared statement
+"__asyncpg_stmt_1__" already exists` even though `database.py` already has the
+per-process random statement-name monkey-patch and `statement_cache_size: 0`.
+
+### Root cause
+`alembic/env.py` creates its own `create_async_engine()` instance — it does **not**
+import from `database.py`. So the monkey-patch that fixes the app's connections doesn't
+apply to the migration runner's connection. PgBouncer retains server connections across
+process restarts; when Alembic opens a fresh connection its asyncpg sequentially names
+prepared statements starting from `__asyncpg_stmt_1__`, colliding with the name left
+over from the previous `alembic current` call.
+
+`statement_cache_size: 0` alone does not prevent internal asyncpg prepared statements
+(such as the one used by SQLAlchemy's dialect initialisation query `SELECT pg_catalog.version()`).
+
+### Fix
+Copy the monkey-patch into `alembic/env.py` and also add `poolclass=NullPool` to the
+migration engine (same as the app engine):
+
+```python
+import uuid
+import asyncpg.connection as _asyncpg_conn
+from sqlalchemy.pool import NullPool
+
+_stmt_base = int(uuid.uuid4().hex[:12], 16)
+
+def _unique_stmt_name(self, prefix):
+    _asyncpg_conn._uid += 1
+    return f"__{prefix}_{_stmt_base + _asyncpg_conn._uid:x}__"
+
+_asyncpg_conn.Connection._get_unique_id = _unique_stmt_name
+
+connectable = create_async_engine(
+    settings.DATABASE_URL,
+    echo=False,
+    poolclass=NullPool,
+    connect_args={"statement_cache_size": 0},
+)
+```
+
+### Rule
+Any script that creates its own asyncpg/SQLAlchemy engine against Supabase PgBouncer
+must apply this monkey-patch before the engine is created — it cannot rely on `database.py`
+having been imported.
+
+---
+
+## 52. Email validator rejects reserved TLDs (.test, .local, .example, .invalid)
+
+### Symptom
+`POST /api/auth/register` returns 422 with:
+`"value is not a valid email address: The part after the @-sign is a special-use or
+reserved name that cannot be used with email."` when the email ends in `.test`,
+`.local`, `.example`, `.invalid`, `.localhost`, or other RFC 2606 reserved TLDs.
+
+### Root cause
+The `email-validator` library (used by Pydantic's `EmailStr`) rejects RFC 2606 / RFC 6761
+special-use domain names by default. `.test` is one of these reserved names.
+
+### Fix
+Use a real-looking TLD in test emails. `@stress-example.com` or `@testuser.io` work.
+Never use `@*.test` in integration tests — it will always be rejected at the validation layer.
+
+### Impact
+This was discovered in `scripts/stress_test.py` — all `register_and_login` calls were
+failing with a 422 before switching from `@stress.test` to `@stress-example.com`.
