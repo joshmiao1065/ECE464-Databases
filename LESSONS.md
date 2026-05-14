@@ -1632,3 +1632,48 @@ Options in order of preference:
 The 776 audio embeddings already in `audio_embeddings` were generated locally during
 ingestion — the stored vectors are fine; only the *query* embedding path is broken
 on Railway.
+
+---
+
+## 44. Vercel Build Cache Silently Ignores `.env.production` Changes
+
+### Symptom
+Updated `frontend/.env.production` with a new `VITE_SEARCH_URL` (ngrok URL).
+Ran `vercel --prod`. The deployed site still sent search requests to Railway instead
+of ngrok — the new URL was not in the bundle. ngrok showed 0 connections; Railway
+continued to OOM on CLAP.
+
+### Root Cause
+Vercel's build cache is keyed on source file hashes. When only `.env.production`
+changed (133 bytes), Vercel detected no changes in the JS/TS source files and
+served the previous cached bundle. `VITE_*` variables are baked at Vite build time
+— if the build is skipped, the old values remain.
+
+### Fix
+Always use `vercel --prod --force` when changing `frontend/.env.production`.
+The `--force` flag bypasses the build cache ("Skipping build cache, deployment was
+triggered without cache") and guarantees a fresh Vite build with the new env values.
+
+### Rule
+`vercel --prod` for code changes. `vercel --prod --force` for `.env.production` changes.
+
+---
+
+## 45. Vercel Preview URL vs Production URL — Different Bundles
+
+### Symptom
+After deploying with `vercel --prod --force`, tested text search on a Vercel URL
+that looked like `https://audio-sample-manager-jjh3bu241-josh-miao-s-projects.vercel.app`.
+Search still failed (ngrok showed 0 connections).
+
+### Root Cause
+Vercel creates a unique per-deployment preview URL for every deploy, including
+production deploys. The preview URL (`-jjh3bu241-...`) points to that specific
+deployment's bundle. But the `--force` rebuild produced a *new* deployment with a
+different preview URL. The user was still on an old preview URL from a previous
+(non-forced) build that had the stale bundle without `VITE_SEARCH_URL`.
+
+### Fix
+Always test the canonical production alias: `https://audio-sample-manager.vercel.app`.
+That alias is updated atomically at deploy time to point to the latest production build.
+Preview URLs are immutable snapshots — they never update.
