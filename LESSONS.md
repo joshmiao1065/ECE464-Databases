@@ -1885,3 +1885,57 @@ Never use `@*.test` in integration tests — it will always be rejected at the v
 ### Impact
 This was discovered in `scripts/stress_test.py` — all `register_and_login` calls were
 failing with a 422 before switching from `@stress.test` to `@stress-example.com`.
+
+---
+
+## 53. Module-level `import librosa` adds ~100-150 MB to Railway startup; make it lazy
+
+### Symptom
+Railway OOM alert after new builds. The `app/routers/samples.py` had a top-level
+`from app.workers.librosa_worker import extract_features`. Because Python executes
+module-level imports at server startup, `librosa` (and numpy) are loaded into every
+Railway process — including processes that will never run the MIR pipeline (because
+`RAILWAY_ENVIRONMENT` guards the pipeline from triggering on Railway). This wastes
+100-150 MB of the 512 MB Railway free-tier limit permanently.
+
+### Root cause
+`librosa_worker.py` has module-level `import librosa` and `import numpy as np`.
+Importing anything from `librosa_worker` at the top of `samples.py` causes Python
+to execute `librosa_worker.py` in full at startup, loading both libraries.
+On Railway, the MIR pipeline never actually runs (guarded by `RAILWAY_ENVIRONMENT`),
+so this was paying 100-150 MB of startup cost for zero benefit.
+
+### Fix
+Remove the top-level import from `samples.py`. Add a **local import** inside
+`_run_mir_pipeline()` just before the call site:
+
+```python
+# Inside _run_mir_pipeline, just before extract_features is called:
+from app.workers.librosa_worker import extract_features  # lazy: keeps librosa out of Railway startup
+features = await loop.run_in_executor(None, extract_features, audio_bytes)
+```
+
+Python's import system caches modules in `sys.modules` after the first import, so
+there is **no performance cost** on subsequent calls — the local import resolves
+from cache in nanoseconds. The only effect is that librosa loads on first pipeline
+execution (local dev only), not at server startup.
+
+### Secondary fix: add `RAILWAY_ENVIRONMENT` guard to `POST /api/samples/`
+
+The programmatic `POST /api/samples/` endpoint (used by ingest scripts) had no
+Railway guard — it always queued `_run_mir_pipeline` as a BackgroundTask. On Railway,
+that background task would load CLAP (~900 MB) the moment the first sample was created
+via this endpoint. Added the same guard that `POST /api/samples/upload` already had:
+
+```python
+if not os.environ.get("RAILWAY_ENVIRONMENT"):
+    background_tasks.add_task(_run_mir_pipeline, sample.id)
+else:
+    log.info("Railway env detected — sample %s queued for local MIR worker.", sample.id)
+```
+
+### Rule
+Any import that transitively loads a large ML library (librosa, tensorflow, torch, clap)
+must be a **local import inside the function that actually needs it**, not a module-level
+import. On Railway, module-level heavy imports cost memory even when the functionality
+they enable is never called.
