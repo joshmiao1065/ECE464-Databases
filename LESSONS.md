@@ -1939,3 +1939,47 @@ Any import that transitively loads a large ML library (librosa, tensorflow, torc
 must be a **local import inside the function that actually needs it**, not a module-level
 import. On Railway, module-level heavy imports cost memory even when the functionality
 they enable is never called.
+
+---
+
+## 54. Stale Vercel bundle causes search to hit Railway instead of ngrok
+
+### Symptom
+Text search returns "Semantic search needs CLAP, which can't run on the free-tier server"
+(the frontend's 502/503 error message). ngrok terminal shows **0 connections**. The request
+is going to Railway, not the local ngrok tunnel.
+
+### Root cause
+`VITE_SEARCH_URL` is baked into the Vite bundle at build time. If the last `vercel --prod`
+was run with a stale or empty `VITE_SEARCH_URL` in `frontend/.env.production`, the
+deployed bundle falls back to `VITE_API_URL` (Railway) for all search requests.
+`createSearchApi()` in `client.ts` uses `??` which only catches `null`/`undefined` —
+so an empty string would also go to Railway. The Railway backend now returns 503
+immediately (from the guard added in §53), which triggers the frontend's CLAP error message.
+
+Additionally, if `localStorage.getItem("search_api_url")` was previously set to
+`"http://localhost:8000"` (for local dev testing), it would override `VITE_SEARCH_URL`
+and cause network errors from the Vercel-hosted page (cross-origin localhost is blocked).
+
+### Diagnosis
+1. Check ngrok terminal — 0 connections means the request is NOT going through ngrok.
+2. Open browser console: `localStorage.getItem("search_api_url")` — if set to localhost, clear it.
+3. Railway logs showing 503 on `/api/search/text` = request is hitting Railway.
+
+### Fix
+**Immediate (no redeploy):** Set the localStorage override in the browser console:
+```js
+localStorage.setItem("search_api_url", "https://your-ngrok-url.ngrok-free.dev")
+```
+
+**Permanent:** Ensure `frontend/.env.production` has the correct ngrok URL, then:
+```bash
+vercel --prod
+```
+(`--force` is not required — plain `vercel --prod` picks up `.env.production` changes.)
+
+### Rule
+After any ngrok restart that changes the URL (free tier without a reserved domain),
+run `vercel --prod` to rebake `VITE_SEARCH_URL` into the bundle. With a registered
+ngrok account (reserved subdomain), the URL stays the same across restarts — only
+run `vercel --prod` if the URL actually changes.
