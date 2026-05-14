@@ -1738,3 +1738,78 @@ field-level errors like an invalid email or too-short username/password.
    rendered as `<ul class="error-list">` in the JSX.
 4. Fixed `minLength` on the password input from 6 → 8 to match the backend schema
    (`password: str = Field(..., min_length=8)`).
+
+---
+
+## 48. Supabase PgBouncer blocks REFRESH MATERIALIZED VIEW — use a regular table cache instead
+
+### Symptom
+`REFRESH MATERIALIZED VIEW` raises an error (or hangs) when run through the application's
+asyncpg connection pool that connects via Supabase's PgBouncer.
+
+### Root Cause
+Supabase PgBouncer operates in **transaction pooling mode**. In this mode every statement
+is wrapped in an implicit transaction. `REFRESH MATERIALIZED VIEW` is a DDL command that
+must run outside a transaction (or in a transaction it controls). PgBouncer's implicit
+transaction wrapping conflicts with this requirement.
+
+### Fix
+Use a regular table as a manual ranking cache (`trending_cache`). A background computation
+query truncates the table and inserts fresh rows on a TTL basis. The API endpoint reads from
+the cache table with a simple `SELECT`. No DDL is ever called from application code.
+
+### Rule
+Do not use `REFRESH MATERIALIZED VIEW` in any code path that runs through PgBouncer.
+Use a regular table with a `computed_at` timestamp column for any pre-computed ranking or
+aggregation that needs periodic refresh. Alembic migrations run on a direct asyncpg engine
+(not through PgBouncer) so DDL in migrations is safe.
+
+---
+
+## 49. APScheduler / background scheduler not reliable on Railway — use TTL-based lazy eval
+
+### Symptom
+APScheduler or any in-process scheduler that starts from FastAPI's startup event will
+lose its schedule silently whenever Railway restarts the container. Since Railway can
+restart at any time (health check failure, deploy, memory pressure), scheduled tasks
+that should run every N days may not run for much longer than that, or may run at the
+wrong times relative to the restart cycle.
+
+### Root Cause
+Railway runs each deployment as an ephemeral container. In-process schedulers are
+stateless — their schedule state lives only in process memory and is lost on restart.
+
+### Fix
+For infrequently-updated data (rankings, caches), use **TTL-based lazy evaluation**:
+check `computed_at` on first read; if older than the TTL, recompute inline and update
+the cache row before returning. The first caller after a TTL expiry pays the compute
+cost, but the approach is completely stateless and survives any number of restarts.
+
+For more time-sensitive scheduled work, use an external trigger (Railway cron jobs in
+paid tier, GitHub Actions scheduled workflow, or a separate `scripts/*.py` run manually).
+
+---
+
+## 50. collections.is_private → visibility migration: 4-step pattern for breaking column changes
+
+### Context
+The `collections` table had `is_private BOOLEAN NOT NULL DEFAULT false`. Replacing it
+with `visibility VARCHAR(20) NOT NULL DEFAULT 'public' CHECK (visibility IN (...))`
+requires a data migration on live data — you cannot simply drop and re-add a NOT NULL column.
+
+### Safe migration pattern (works in Alembic async runner + Supabase)
+1. `op.add_column` — add the new column as **nullable** (no default needed yet; avoids
+   locking issues with large tables when adding NOT NULL + DEFAULT simultaneously)
+2. `op.execute("UPDATE collections SET visibility = CASE WHEN is_private THEN 'private' ELSE 'public' END")`
+3. `op.alter_column` — set `nullable=False` and `server_default='public'`
+4. `op.create_check_constraint` — add the CHECK constraint
+5. `op.drop_column('collections', 'is_private')` — remove the old column
+
+All code that references `collection.is_private` (ORM model, Pydantic schemas, router,
+frontend TypeScript types) must be updated atomically in the same PR as this migration.
+
+### Why not do it in one ALTER TABLE?
+PostgreSQL rewrites the entire table when adding a NOT NULL column with a non-trivial
+DEFAULT (prior to PG 11 it always rewrites; after PG 11 it can be instant for simple
+defaults but a full rewrite still happens for CHECK constraints added simultaneously).
+Splitting into add-nullable → backfill → alter is safer and clearer in Alembic diffs.
