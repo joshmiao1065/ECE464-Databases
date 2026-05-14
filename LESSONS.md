@@ -1683,3 +1683,58 @@ different preview URL. The user was still on an old preview URL from a previous
 Always test the canonical production alias: `https://audio-sample-manager.vercel.app`.
 That alias is updated atomically at deploy time to point to the latest production build.
 Preview URLs are immutable snapshots — they never update.
+
+---
+
+## 46. Comment double-submission — disable button during async request
+
+### Symptom
+Clicking "Post" multiple times before the network response returned caused `postComment`
+to fire multiple identical requests, resulting in duplicate comments in the DB and UI.
+
+### Root Cause
+`handleComment` had no in-flight guard. The button was only disabled when the textarea
+was empty, not while the comment was being submitted.
+
+### Fix
+Added `submittingComment` state (`useState(false)`). Set it to `true` before
+`await postComment(...)`, reset to `false` in a `finally` block. The button
+`disabled` prop includes `|| submittingComment`, and the label changes to
+"Posting…" during submission. Guard also short-circuits the handler with an early
+return if `submittingComment` is already true.
+
+### Rule
+Any button that fires a network request must be disabled for the duration of that
+request. Use a dedicated boolean state, not a generic `loading` flag shared with
+page-level loading, so other UI is not inadvertently locked.
+
+---
+
+## 47. Registration — email format validation and specific Pydantic error rendering
+
+### Symptom
+Two issues: (1) Users could submit the registration form with a syntactically invalid
+email (browser `type="email"` can be bypassed). (2) When FastAPI/Pydantic returned a
+422 Unprocessable Entity with a `detail` array, the frontend caught
+`err.response.data.detail` but only handled the `typeof detail === "string"` case,
+falling back to the generic "Registration failed." for all structured validation errors.
+
+### Root Cause
+The Pydantic v2 validation error shape is:
+```json
+{"detail": [{"type": "...", "loc": ["body", "field"], "msg": "...", "input": "..."}]}
+```
+`detail` is a list, not a string, so `typeof detail === "string"` was always false for
+field-level errors like an invalid email or too-short username/password.
+
+### Fix
+1. Added client-side pre-validation in `handleSubmit` (regex email check,
+   `username.length >= 3`, `password.length >= 8`) — returns early with a list of
+   errors before hitting the network.
+2. In the catch block, check `Array.isArray(detail)`: if true, map each entry to
+   `"FieldName: message"` using `e.loc[e.loc.length - 1]` as the field name.
+   Single-string errors (e.g. "Email already registered") still render as before.
+3. Replaced the single `error` string state with an `errors: string[]` array;
+   rendered as `<ul class="error-list">` in the JSX.
+4. Fixed `minLength` on the password input from 6 → 8 to match the backend schema
+   (`password: str = Field(..., min_length=8)`).
