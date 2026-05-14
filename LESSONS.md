@@ -1624,14 +1624,20 @@ home page list. The user read this as "search returned the home page samples."
 - Added `onError` prop to `SearchBar`; `BrowsePage` manages an `error` state and
   renders a dismissable red banner.
 
-### How to actually use text/audio search
-CLAP must be running in the same process that handles the search request.
-Options in order of preference:
-1. Run backend locally (`uvicorn app.main:app --reload`) → test at localhost:8000/docs.
-2. Upgrade Railway to Starter plan ($5/mo, 8 GB RAM) → CLAP loads normally.
-The 776 audio embeddings already in `audio_embeddings` were generated locally during
-ingestion — the stored vectors are fine; only the *query* embedding path is broken
-on Railway.
+### Solution implemented (confirmed working)
+Route search requests to the local machine via ngrok instead of Railway:
+- `createSearchApi()` in `frontend/src/api/client.ts` reads `VITE_SEARCH_URL`
+  (baked at build time from `frontend/.env.production`) with a `localStorage`
+  runtime override as fallback.
+- Only `POST /api/search/text` and `POST /api/search/audio` use this instance;
+  all other requests still go to Railway via the normal `api` instance.
+- `ngrok-skip-browser-warning: 1` header bypasses the ngrok browser interstitial.
+- CORS already allowed via `allow_origin_regex` in `app/main.py`.
+
+Both text search and audio search confirmed working end-to-end on the deployed
+Vercel frontend (`audio-sample-manager.vercel.app`) routing through ngrok to the
+local CLAP backend. See LESSONS.md §44-45 for the Vercel cache and preview URL
+gotchas encountered during setup.
 
 ---
 
