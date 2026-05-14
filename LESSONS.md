@@ -1983,3 +1983,39 @@ After any ngrok restart that changes the URL (free tier without a reserved domai
 run `vercel --prod` to rebake `VITE_SEARCH_URL` into the bundle. With a registered
 ngrok account (reserved subdomain), the URL stays the same across restarts — only
 run `vercel --prod` if the URL actually changes.
+
+---
+
+## 55. Supabase free tier pauses projects after 1 week of inactivity
+
+### Symptom
+Every API endpoint returns 500. The local uvicorn server starts fine (no import errors),
+but the first DB query fails with:
+
+```
+asyncpg.exceptions.InternalServerError: (ENOTFOUND) tenant/user <project-ref> not found
+```
+
+The `nc -zv <pooler-host> 5432` check succeeds (TCP port is open), so the issue is not
+a network/firewall problem.
+
+### Root Cause
+Supabase pauses free-tier projects after approximately 7 days of no database activity.
+When a project is paused, the PgBouncer pooler still accepts TCP connections but
+immediately rejects auth with the `tenant/user not found` error — the project container
+is not running.
+
+### Fix
+1. Go to `https://supabase.com/dashboard/project/<your-project-ref>`
+2. Click **"Resume project"** — takes 30–60 seconds
+3. Re-run uvicorn; the first request may take a few extra seconds while the pool warms up
+
+### Prevention
+- Touch the database at least once every 5–6 days (a simple `GET /api/admin/queue` is enough)
+- Before a demo, resume the project the day before and verify with `curl http://localhost:8000/api/admin/queue`
+- Upgrade to Supabase Pro ($25/mo) temporarily around the demo date to guarantee uptime
+
+### Rule
+If you see `(ENOTFOUND) tenant/user <ref> not found` from asyncpg, the Supabase project
+is paused — not a code bug. Go resume it in the dashboard first, then investigate further
+only if the error persists after resumption.
